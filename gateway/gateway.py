@@ -13,9 +13,10 @@
   python3 gateway.py enable <الاسم>    يرجّع شخص
   python3 gateway.py review [أيام|off] حساب مؤقت لمراجعة Apple
   python3 gateway.py version          نسخة البوابة
+  python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -36,6 +37,9 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser("~/Library/Application Support/PrivateAI-Gateway")
+BACKUPS = os.path.join(HOME, "backups")
+MAX_BACKUP = 200 * 1024 * 1024
+MAX_MEMORY = 4000
 CONFIG = os.path.join(HOME, "config.json")
 USERS = os.path.join(HOME, "users.json")
 PAIR = os.path.join(HOME, "pair.json")
@@ -115,7 +119,7 @@ def claude_used(u):
 
 def public(u):
     """اللي نرجّعه للتطبيق: بدون المفتاح ومفتاح Claude الخاص."""
-    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id")}
+    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at")}
     out.setdefault("paired", True)
     out["claude_limit"] = u.get("claude_limit", CLAUDE_DEFAULT_LIMIT)
     out["claude_used"] = claude_used(u)
@@ -283,6 +287,14 @@ class Gateway(BaseHTTPRequestHandler):
                 return
             if path == "/gateway/me":
                 return self.me(u)
+            if path == "/gateway/settings":
+                return self.settings(u, method)
+            if path == "/gateway/me/memory":
+                return self.memory(u, method)
+            if path == "/gateway/me/learn" and method == "POST":
+                return self.learn(u)
+            if path == "/gateway/me/backup":
+                return self.backup(u, method)
             if path == "/gateway/pair-code" and method == "POST":
                 if u["role"] != "owner":
                     return self.error(403, "للمالك بس.")
@@ -458,11 +470,129 @@ class Gateway(BaseHTTPRequestHandler):
         threading.Timer(1.0, lambda: os._exit(0)).start()
 
     def me(self, u):
-        self.reply(200, {"user": public(u), "services": services(u), "claude": {
+        self.reply(200, {"user": public(u), "services": services(u), "settings": shared_settings(u), "memory": u.get("memory", ""), "claude": {
             "shared": bool(shared_claude_key()), "own_key": bool(u.get("claude_key")),
             "limit": None if u["role"] == "owner" or u.get("claude_key") else u.get("claude_limit", CLAUDE_DEFAULT_LIMIT),
             "used": claude_used(u),
         }})
+
+    # ── إعدادات مشتركة: الجهاز الجديد ياخذها تلقائياً بعد الربط ──
+    def settings(self, u, method):
+        if method == "POST":
+            if u["role"] != "owner":
+                return self.error(403, "للمالك بس.")
+            req = json.loads(self.body() or b"{}")
+            with LOCK:
+                cfg = load(CONFIG, {})
+                shared = cfg.setdefault("shared", {})
+                for k in ("kuma_slug", "wake_url"):
+                    if k in req:
+                        v = str(req[k] or "").strip()
+                        if v:
+                            shared[k] = v
+                        else:
+                            shared.pop(k, None)
+                save(CONFIG, cfg)
+        return self.reply(200, shared_settings(u))
+
+    # ── ذاكرتك: معلومات عنك تنضاف لكل محادثة، ومشتركة بين أجهزتك ──
+    def memory(self, u, method):
+        if method == "POST":
+            text = str(json.loads(self.body() or b"{}").get("memory", ""))[:MAX_MEMORY]
+            with LOCK:
+                data = load(USERS, {"users": []})
+                for x in data["users"]:
+                    if x["id"] == u["id"]:
+                        x["memory"] = text
+                save(USERS, data)
+            return self.reply(200, {"memory": text})
+        return self.reply(200, {"memory": u.get("memory", "")})
+
+    # ── يتعلّم من المحادثة: الموديل المحلي يطلّع معلومات ثابتة عنك (على الماك بس) ──
+    def learn(self, u):
+        req = json.loads(self.body() or b"{}")
+        model = str(req.get("model") or "")
+        if not model or model.startswith("claude"):
+            return self.error(400, "يحتاج موديل محلي.")
+        lines = []
+        for m in (req.get("messages") or [])[-24:]:
+            text = str(m.get("content") or "").strip()[:2500]
+            if text:
+                lines.append(("المستخدم: " if m.get("role") == "user" else "المساعد: ") + text)
+        convo = "\n\n".join(lines)[-14000:]
+        if not any(l.startswith("المستخدم") for l in lines):
+            return self.reply(200, {"added": [], "memory": u.get("memory", "")})
+        current = u.get("memory", "")
+        prompt = LEARN_PROMPT.replace("{memory}", current or "(فاضية)").replace("{convo}", convo)
+        body = json.dumps({
+            "model": model, "stream": False, "format": "json",
+            "messages": [{"role": "user", "content": prompt}],
+            "options": {"temperature": 0.1, "num_ctx": 8192},
+        }).encode()
+        upstream = load(CONFIG, {})["upstreams"]["ollama"].rstrip("/")
+        try:
+            r = urllib.request.urlopen(urllib.request.Request(
+                upstream + "/api/chat", data=body, headers={"Content-Type": "application/json"}), timeout=240)
+            content = json.loads(r.read()).get("message", {}).get("content", "")
+            facts = json.loads(content).get("facts", [])
+        except Exception as e:
+            sys.stderr.write("learn failed: %s\n" % e)
+            return self.error(502, "الموديل ما رد صح، بيحاول المرة الجاية.")
+        have = [x.strip() for x in current.splitlines() if x.strip()]
+        lower = [x.lower() for x in have]
+        added = []
+        for f in facts if isinstance(facts, list) else []:
+            f = re.sub(r"\s+", " ", str(f)).strip(" -•.")
+            if not (4 <= len(f) <= 200) or any(f.lower() in x or x in f.lower() for x in lower):
+                continue
+            added.append(f)
+            lower.append(f.lower())
+            if len(added) >= 5:
+                break
+        if added:
+            text = "\n".join(have + added)[:MAX_MEMORY]
+            with LOCK:
+                data = load(USERS, {"users": []})
+                for x in data["users"]:
+                    if x["id"] == u["id"]:
+                        x["memory"] = text
+                save(USERS, data)
+            current = text
+        return self.reply(200, {"added": added, "memory": current})
+
+    # ── نسخة احتياطية للمحادثات: كل شخص له ملف واحد على الماك ──
+    def backup(self, u, method):
+        path = os.path.join(BACKUPS, re.sub(r"[^0-9a-f]", "", u["id"]) + ".json")
+        if method == "POST":
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > MAX_BACKUP:
+                return self.error(413, "النسخة كبيرة زيادة.")
+            data = self.rfile.read(n)
+            try:
+                json.loads(data)
+            except ValueError:
+                return self.error(400, "ملف غير صالح.")
+            os.makedirs(BACKUPS, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+            os.replace(tmp, path)
+            return self.reply(200, {"size": n, "at": int(os.path.getmtime(path))})
+        if method == "DELETE":
+            if os.path.exists(path):
+                os.remove(path)
+            return self.reply(200, {"deleted": True})
+        if not os.path.exists(path):
+            return self.error(404, "ما فيه نسخة محفوظة على الماك.")
+        if "info" in urllib.parse.urlsplit(self.path).query:
+            return self.reply(200, {"size": os.path.getsize(path), "at": int(os.path.getmtime(path))})
+        with open(path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     # ── Claude: مفتاح المالك مع حد يومي، أو مفتاح الشخص نفسه بدون حد ──
     def claude_shared(self, u, method):
@@ -629,6 +759,78 @@ def shared_claude_key():
     return load(CONFIG, {}).get("claude_key", "")
 
 
+LEARN_PROMPT = """مهمتك تطلّع من المحادثة معلومات ثابتة عن المستخدم نفسه، تفيد مساعده في محادثات جاية.
+
+احفظ بس:
+- اسمه، شغله، مدينته، لغته أو لهجته
+- أجهزته وأنظمته وسيرفراته ومشاريعه المستمرة
+- طريقته المفضّلة في الردود (مختصر، بالعامية، بالتفصيل…)
+- اهتمامات ثابتة ذكرها هو بنفسه
+
+لا تحفظ:
+- أشياء مؤقتة (اليوم، بكرة، موعد، مزاج، مشكلة انحلّت)
+- معلومات عن ناس ثانيين، أو أسئلة عامة ما تخصّه
+- أي شي قاله المساعد وما أكّده المستخدم
+- كلمات سر، مفاتيح، أرقام حسابات أو هويات
+- صحة أو أمراض أو أمور حساسة
+
+اللي محفوظ من قبل (لا تكرره):
+{memory}
+
+المحادثة:
+{convo}
+
+رد بـ JSON بس بهالشكل: {"facts": ["جملة قصيرة", ...]}
+كل جملة بالعربي، قصيرة، بصيغة الغائب (مثل: يشتغل مطوّر تطبيقات). لو ما فيه شي جديد يستاهل: {"facts": []}"""
+
+
+def shared_settings(u):
+    """الإعدادات اللي ياخذها أي جهاز بعد الربط."""
+    cfg = load(CONFIG, {})
+    shared = cfg.get("shared", {})
+    out = {}
+    if has(u, "servers") and shared.get("kuma_slug"):
+        out["kuma_slug"] = shared["kuma_slug"]
+    if shared.get("wake_url") and cfg.get("wake_token"):
+        out["wake_url"] = shared["wake_url"]
+        out["wake_token"] = cfg["wake_token"]
+    return out
+
+
+def mac_address():
+    """عنوان كرت الشبكة (للتصحية). السلك أول، وبعده الواي فاي."""
+    for dev in ("en0", "en1"):
+        try:
+            out = subprocess.run(["ifconfig", dev], capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            continue
+        m = re.search(r"ether ([0-9a-f:]{17})", out)
+        if m and "status: active" in out:
+            return dev, m.group(1)
+    return None, None
+
+
+WAKER = r'''import os, socket, http.server
+MAC = bytes.fromhex(os.environ["MAC"].replace(":", "").replace("-", ""))
+PACKET = b"\xff" * 6 + MAC * 16
+TOKEN = os.environ["TOKEN"]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path.rstrip("/") != "/wake" or self.headers.get("Authorization") != "Bearer " + TOKEN:
+            self.send_response(403); self.end_headers(); return
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for addr in ("255.255.255.255", os.environ.get("BROADCAST", "")):
+            for port in (9, 7):
+                if addr: s.sendto(PACKET, (addr, port))
+        self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers()
+        self.wfile.write(b'{"ok": true}')
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'{"waker": true}')
+http.server.ThreadingHTTPServer(("", int(os.environ.get("PORT", "9009"))), H).serve_forever()
+'''
+
+
 def find_user_by_id(user_id):
     return next((x for x in load(USERS, {"users": []})["users"] if x["id"] == user_id), None)
 
@@ -659,6 +861,34 @@ def main():
 
     elif cmd == "version":
         print(VERSION)
+
+    elif cmd == "wake-setup":
+        url = sys.argv[2] if len(sys.argv) > 2 else ""
+        dev, mac = mac_address()
+        if not mac:
+            print("ما لقيت كرت شبكة متصل (en0/en1).")
+            sys.exit(1)
+        with LOCK:
+            cfg = load(CONFIG, {})
+            cfg.setdefault("wake_token", secrets.token_urlsafe(24))
+            if url:
+                cfg.setdefault("shared", {})["wake_url"] = url.rstrip("/")
+            save(CONFIG, cfg)
+        if dev != "en0":
+            print("\n  ⚠️ الماك متصل واي فاي. التصحية تشتغل أضمن بالسلك.\n")
+        port = urllib.parse.urlsplit(url).port or 9009 if url else 9009
+        print("\n  1) على الماك (مرة وحدة):\n")
+        print("      sudo pmset -a womp 1 && sudo pmset -a tcpkeepalive 1\n")
+        print("  2) في الـ NAS: Container Manager ← Project ← Create، والصق هذا:\n")
+        print("services:\n  mac-waker:\n    image: python:3.12-alpine\n    container_name: mac-waker")
+        print("    network_mode: host\n    restart: unless-stopped\n    environment:")
+        print('      MAC: "%s"\n      TOKEN: "%s"\n      PORT: "%d"' % (mac, cfg["wake_token"], port))
+        print("    command:\n      - python\n      - -c\n      - |")
+        for line in WAKER.splitlines():
+            print("        " + line)
+        print("\n  3) " + ("خلاص ✓ التطبيقات بتاخذ العنوان تلقائياً." if url else
+                         "شغّل الأمر مرة ثانية مع عنوان الـ NAS: python3 gateway.py wake-setup http://<NAS>:9009"))
+        print("     لما الماك ما يرد، بيطلع لك زر «صحّ الماك» في التطبيق.\n")
 
     elif cmd == "review":
         # حساب لمراجعة Apple: محادثة بس، ورمز يتكرر لين ينتهي (الافتراضي 14 يوم)
