@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>دعوة لمساعدي</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  .card { max-width: 420px; margin: 48px auto; padding: 28px 22px; text-align: center; }
+  .card img { width: 84px; height: 84px; border-radius: 20px; }
+  .btn { display: block; margin: 22px 0 10px; padding: 14px; border-radius: 14px; background: #3C3489; color: #fff; text-decoration: none; font-size: 18px; }
+  .muted { color: #777; font-size: 14px; line-height: 1.7; }
+</style>
+</head>
+<body>
+<div class="card">
+  <img src="icon.png" alt="">
+  <h1>دعوة لمساعدي</h1>
+  <p class="muted">لازم يكون تطبيق مساعدي مثبّت عندك، و Tailscale شغّال.</p>
+  <a id="open" class="btn" href="#">افتح في مساعدي</a>
+  <p class="muted" id="hint">لو ما انفتح التطبيق: انسخ رابط هالصفحة، وافتح مساعدي ← الإعدادات ← البوابة، والصقه في خانة الرمز.</p>
+</div>
+<script>
+  // البيانات بعد # فما توصل لأي سيرفر، تبقى في جوالك
+  var q = location.hash.replace(/^#/, "");
+  var app = "privateai://pair?" + q;
+  var a = document.getElementById("open");
+  if (q.indexOf("code=") < 0) {
+    a.style.display = "none";
+    document.getElementById("hint").textContent = "الرابط ناقص. اطلب دعوة جديدة.";
+  } else {
+    a.href = app;
+    setTimeout(function () { location.href = app; }, 300);
+  }
+</script>
+</body>
+</html>
