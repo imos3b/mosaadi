@@ -16,7 +16,7 @@
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -119,7 +119,7 @@ def claude_used(u):
 
 def public(u):
     """اللي نرجّعه للتطبيق: بدون المفتاح ومفتاح Claude الخاص."""
-    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at")}
+    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at", "learned")}
     out.setdefault("paired", True)
     out["claude_limit"] = u.get("claude_limit", CLAUDE_DEFAULT_LIMIT)
     out["claude_used"] = claude_used(u)
@@ -372,6 +372,16 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.reply(200, tags)
             return self.error(status, "Ollama رد بخطأ.")
 
+        if rest in ("/api/chat", "/api/generate"):
+            # نعدّ المحادثات الشغالة: التعلّم ينتظر لين Ollama يفضى
+            with BUSY_LOCK:
+                BUSY["active"] += 1
+            try:
+                return self.proxy(method, upstream, rest, data)
+            finally:
+                with BUSY_LOCK:
+                    BUSY["active"] -= 1
+                    BUSY["last"] = time.time()
         return self.proxy(method, upstream, rest, data)
 
     # ── تمرير الطلب (مع البث كلمة كلمة) ──
@@ -470,7 +480,7 @@ class Gateway(BaseHTTPRequestHandler):
         threading.Timer(1.0, lambda: os._exit(0)).start()
 
     def me(self, u):
-        self.reply(200, {"user": public(u), "services": services(u), "settings": shared_settings(u), "memory": u.get("memory", ""), "claude": {
+        self.reply(200, {"user": public(u), "services": services(u), "settings": shared_settings(u), "memory": u.get("memory", ""), "learned": u.get("learned"), "claude": {
             "shared": bool(shared_claude_key()), "own_key": bool(u.get("claude_key")),
             "limit": None if u["role"] == "owner" or u.get("claude_key") else u.get("claude_limit", CLAUDE_DEFAULT_LIMIT),
             "used": claude_used(u),
@@ -510,6 +520,7 @@ class Gateway(BaseHTTPRequestHandler):
 
     # ── يتعلّم من المحادثة: الموديل المحلي يطلّع معلومات ثابتة عنك (على الماك بس) ──
     def learn(self, u):
+        """ما يشغّل الموديل الحين: يحطها في طابور، وتنعمل لما Ollama يفضى (ما تبطّئ أسئلتك)."""
         req = json.loads(self.body() or b"{}")
         model = str(req.get("model") or "")
         if not model or model.startswith("claude"):
@@ -519,46 +530,13 @@ class Gateway(BaseHTTPRequestHandler):
             text = str(m.get("content") or "").strip()[:2500]
             if text:
                 lines.append(("المستخدم: " if m.get("role") == "user" else "المساعد: ") + text)
-        convo = "\n\n".join(lines)[-14000:]
-        if not any(l.startswith("المستخدم") for l in lines):
-            return self.reply(200, {"added": [], "memory": u.get("memory", "")})
-        current = u.get("memory", "")
-        prompt = LEARN_PROMPT.replace("{memory}", current or "(فاضية)").replace("{convo}", convo)
-        body = json.dumps({
-            "model": model, "stream": False, "format": "json",
-            "messages": [{"role": "user", "content": prompt}],
-            "options": {"temperature": 0.1, "num_ctx": 8192},
-        }).encode()
-        upstream = load(CONFIG, {})["upstreams"]["ollama"].rstrip("/")
-        try:
-            r = urllib.request.urlopen(urllib.request.Request(
-                upstream + "/api/chat", data=body, headers={"Content-Type": "application/json"}), timeout=240)
-            content = json.loads(r.read()).get("message", {}).get("content", "")
-            facts = json.loads(content).get("facts", [])
-        except Exception as e:
-            sys.stderr.write("learn failed: %s\n" % e)
-            return self.error(502, "الموديل ما رد صح، بيحاول المرة الجاية.")
-        have = [x.strip() for x in current.splitlines() if x.strip()]
-        lower = [x.lower() for x in have]
-        added = []
-        for f in facts if isinstance(facts, list) else []:
-            f = re.sub(r"\s+", " ", str(f)).strip(" -•.")
-            if not (4 <= len(f) <= 200) or any(f.lower() in x or x in f.lower() for x in lower):
-                continue
-            added.append(f)
-            lower.append(f.lower())
-            if len(added) >= 5:
-                break
-        if added:
-            text = "\n".join(have + added)[:MAX_MEMORY]
-            with LOCK:
-                data = load(USERS, {"users": []})
-                for x in data["users"]:
-                    if x["id"] == u["id"]:
-                        x["memory"] = text
-                save(USERS, data)
-            current = text
-        return self.reply(200, {"added": added, "memory": current})
+        if any(l.startswith("المستخدم") for l in lines):
+            with BUSY_LOCK:
+                # محادثة وحدة لكل شخص بالطابور (الأحدث تكفي)
+                LEARN_QUEUE[:] = [j for j in LEARN_QUEUE if j["user"] != u["id"]]
+                LEARN_QUEUE.append({"user": u["id"], "model": model, "convo": "\n\n".join(lines)[-14000:]})
+            LEARN_EVENT.set()
+        return self.reply(200, {"queued": True})
 
     # ── نسخة احتياطية للمحادثات: كل شخص له ملف واحد على الماك ──
     def backup(self, u, method):
@@ -784,6 +762,70 @@ LEARN_PROMPT = """مهمتك تطلّع من المحادثة معلومات ث�
 كل جملة بالعربي، قصيرة، بصيغة الغائب (مثل: يشتغل مطوّر تطبيقات). لو ما فيه شي جديد يستاهل: {"facts": []}"""
 
 
+# ── التعلّم بالخلفية ──
+BUSY = {"active": 0, "last": 0.0}
+BUSY_LOCK = threading.Lock()
+LEARN_QUEUE = []
+LEARN_EVENT = threading.Event()
+LEARN_IDLE = 45   # ثواني بدون أسئلة قبل ما يبدأ
+
+
+def learn_worker():
+    while True:
+        LEARN_EVENT.wait()
+        while True:
+            with BUSY_LOCK:
+                idle = BUSY["active"] == 0 and time.time() - BUSY["last"] > LEARN_IDLE
+                job = LEARN_QUEUE.pop(0) if idle and LEARN_QUEUE else None
+                if not LEARN_QUEUE and job is None and idle:
+                    LEARN_EVENT.clear()
+                    break
+            if job is None:
+                time.sleep(5)
+                continue
+            try:
+                learn_now(job)
+            except Exception as e:
+                sys.stderr.write("learn failed: %s\n" % e)
+
+
+def learn_now(job):
+    u = find_user_by_id(job["user"])
+    if not u:
+        return
+    current = u.get("memory", "")
+    prompt = LEARN_PROMPT.replace("{memory}", current or "(فاضية)").replace("{convo}", job["convo"])
+    body = json.dumps({
+        "model": job["model"], "stream": False, "format": "json",
+        "messages": [{"role": "user", "content": prompt}],
+        "options": {"temperature": 0.1, "num_ctx": 8192},
+    }).encode()
+    upstream = load(CONFIG, {})["upstreams"]["ollama"].rstrip("/")
+    r = urllib.request.urlopen(urllib.request.Request(
+        upstream + "/api/chat", data=body, headers={"Content-Type": "application/json"}), timeout=300)
+    facts = json.loads(json.loads(r.read()).get("message", {}).get("content", "") or "{}").get("facts", [])
+    with LOCK:
+        data = load(USERS, {"users": []})
+        for x in data["users"]:
+            if x["id"] != job["user"]:
+                continue
+            have = [l.strip() for l in x.get("memory", "").splitlines() if l.strip()]
+            lower = [l.lower() for l in have]
+            added = []
+            for f in facts if isinstance(facts, list) else []:
+                f = re.sub(r"\s+", " ", str(f)).strip(" -•.")
+                if not (4 <= len(f) <= 200) or any(f.lower() in l or l in f.lower() for l in lower):
+                    continue
+                added.append(f)
+                lower.append(f.lower())
+                if len(added) >= 5:
+                    break
+            if added:
+                x["memory"] = "\n".join(have + added)[:MAX_MEMORY]
+                x["learned"] = {"lines": added, "at": int(time.time())}
+        save(USERS, data)
+
+
 def shared_settings(u):
     """الإعدادات اللي ياخذها أي جهاز بعد الربط."""
     cfg = load(CONFIG, {})
@@ -856,6 +898,7 @@ def main():
         host, port = cfg.get("host", "0.0.0.0"), int(cfg.get("port", 11500))
         server = ThreadingHTTPServer((host, port), Gateway)
         server.daemon_threads = True
+        threading.Thread(target=learn_worker, daemon=True).start()
         print("البوابة شغالة على %s:%d" % (host, port), flush=True)
         server.serve_forever()
 
