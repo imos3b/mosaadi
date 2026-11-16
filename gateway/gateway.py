@@ -13,12 +13,13 @@
   python3 gateway.py enable <الاسم>    يرجّع شخص
   python3 gateway.py review [أيام|off] حساب مؤقت لمراجعة Apple
   python3 gateway.py version          نسخة البوابة
+  python3 gateway.py merge            يجمع أجهزتك (المالك) في حساب واحد: نفس المحادثات والذاكرة
   python3 gateway.py push-setup <ملف.p8> <Key ID> <Team ID>   تنبيهات الآيفون (مرة وحدة)
   python3 gateway.py push-test        يرسل تنبيه تجربة لأجهزتك
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.4.0"
+VERSION = "1.6.0"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -41,6 +42,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser("~/Library/Application Support/PrivateAI-Gateway")
 BACKUPS = os.path.join(HOME, "backups")
+IMAGES = os.path.join(HOME, "images")
+MAX_IMAGE = 20 * 1024 * 1024
 MAX_BACKUP = 200 * 1024 * 1024
 MAX_MEMORY = 4000
 CONFIG = os.path.join(HOME, "config.json")
@@ -122,7 +125,7 @@ def claude_used(u):
 
 def public(u):
     """اللي نرجّعه للتطبيق: بدون المفتاح ومفتاح Claude الخاص."""
-    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at", "learned", "push")}
+    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at", "learned", "push", "devices")}
     out.setdefault("paired", True)
     out["claude_limit"] = u.get("claude_limit", CLAUDE_DEFAULT_LIMIT)
     out["claude_used"] = claude_used(u)
@@ -143,14 +146,15 @@ def model_allowed(u, model):
 
 # ─────────── الربط بالجوال ───────────
 
-def create_pair_code(role="owner", user_id=None):
+def create_pair_code(role="owner", user_id=None, link=False):
+    """link=True: جهاز ثاني لنفس الشخص (نفس الحساب: المحادثات والذاكرة والاسم مشتركة)."""
     code = "".join(secrets.choice("0123456789") for _ in range(6))
     with LOCK:
         data = load(PAIR, {"codes": []})
         data["codes"] = [c for c in data["codes"] if c["expires"] > now()]
-        data["codes"].append({"code": code, "role": role, "user_id": user_id, "expires": now() + 600})
+        data["codes"].append({"code": code, "role": role, "user_id": user_id, "link": link, "expires": now() + 600})
         save(PAIR, data)
-        if user_id:
+        if user_id and not link:
             users = load(USERS, {"users": []})
             for u in users["users"]:
                 if u["id"] == user_id:
@@ -185,7 +189,15 @@ def redeem(code, device, ip="", device_id=""):
 
         token = new_token()
         data = load(USERS, {"users": []})
-        if match.get("user_id"):
+        if match.get("user_id") and match.get("link"):
+            # جهاز ثاني لك: نفس الحساب بمفتاح جديد
+            user = next((u for u in data["users"] if u["id"] == match["user_id"]), None)
+            if not user:
+                return None, "المستخدم انحذف."
+            user["extra_tokens"] = (user.get("extra_tokens", []) + [token_hash(token)])[-10:]
+            user["devices"] = (user.get("devices", []) + [{"name": device, "at": now()}])[-10:]
+            user["last_used"] = now()
+        elif match.get("user_id"):
             user = next((u for u in data["users"] if u["id"] == match["user_id"]), None)
             if not user:
                 return None, "المستخدم انحذف."
@@ -277,6 +289,9 @@ class Gateway(BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.route("HEAD")
 
+    def do_PUT(self):
+        self.route("PUT")
+
     def route(self, method):
         try:
             path = urllib.parse.urlsplit(self.path).path
@@ -298,6 +313,8 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.learn(u)
             if path == "/gateway/me/backup":
                 return self.backup(u, method)
+            if path.startswith("/gateway/me/images/"):
+                return self.image(u, method, path.rsplit("/", 1)[-1])
             if path == "/gateway/me/name" and method == "POST":
                 return self.set_name(u)
             if path == "/gateway/me/push" and method == "POST":
@@ -307,7 +324,8 @@ class Gateway(BaseHTTPRequestHandler):
             if path == "/gateway/pair-code" and method == "POST":
                 if u["role"] != "owner":
                     return self.error(403, "للمالك بس.")
-                return self.reply(200, {"code": create_pair_code("owner"), "expires_in": 600})
+                # جهاز ثاني لك: ينربط بنفس حسابك (نفس المحادثات والذاكرة)
+                return self.reply(200, {"code": create_pair_code("owner", u["id"], link=True), "expires_in": 600})
             if path == "/gateway/ollama-lock":
                 if u["role"] != "owner":
                     return self.error(403, "للمالك بس.")
@@ -642,9 +660,25 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.error(413, "النسخة كبيرة زيادة.")
             data = self.rfile.read(n)
             try:
-                json.loads(data)
+                new = json.loads(data)
             except ValueError:
                 return self.error(400, "ملف غير صالح.")
+            # المحذوفات ما تضيع: نجمعها مع اللي في النسخة القديمة (لو جهاز بتطبيق قديم رفع بدونها)
+            try:
+                old = json.load(open(path)) if os.path.exists(path) else {}
+            except ValueError:
+                old = {}
+            for field in ("deleted", "deletedMessages"):
+                merged = dict(old.get(field) or {})
+                for k, v in (new.get(field) or {}).items():
+                    merged[k] = max(int(v), int(merged.get(k, 0)))
+                if merged:
+                    new[field] = merged
+            deleted = new.get("deleted") or {}
+            if new.get("deleted") or new.get("deletedMessages"):
+                new["conversations"] = [c for c in new.get("conversations", [])
+                                        if str(min((m.get("createdAt", 0) for m in c.get("messages", [])), default=0)) not in deleted]
+                data = json.dumps(new, ensure_ascii=False).encode()
             os.makedirs(BACKUPS, exist_ok=True)
             tmp = path + ".tmp"
             with open(tmp, "wb") as f:
@@ -663,6 +697,39 @@ class Gateway(BaseHTTPRequestHandler):
             data = f.read()
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    # ── صور المحادثات: كل صورة ترتفع مرة وحدة (اسمها = بصمتها sha256) ──
+    def image(self, u, method, digest):
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            return self.error(400, "اسم صورة غلط.")
+        folder = os.path.join(IMAGES, re.sub(r"[^0-9a-f]", "", u["id"]))
+        path = os.path.join(folder, digest)
+        if method == "PUT":
+            n = int(self.headers.get("Content-Length") or 0)
+            if n <= 0 or n > MAX_IMAGE:
+                return self.error(413, "الصورة كبيرة زيادة.")
+            data = self.rfile.read(n)
+            if hashlib.sha256(data).hexdigest() != digest:
+                return self.error(400, "الصورة وصلت ناقصة.")
+            os.makedirs(folder, exist_ok=True)
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+            return self.reply(200, {"ok": True})
+        if not os.path.exists(path):
+            return self.error(404, "الصورة مو موجودة.")
+        if method == "HEAD":
+            self.send_response(200)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        with open(path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -1283,6 +1350,51 @@ def main():
         # الرمز في سطر لحاله وبدون مسافات: لو انطبع جنب كلام عربي، الترمنال في الجوال يقلب ترتيب الأرقام
         print("\n  رمز الربط (يصلح 10 دقايق):\n\n      %s\n" % code)
         print("  في التطبيق: الإعدادات ← البوابة ← اكتب الرمز. يصلح 10 دقايق.\n")
+
+    elif cmd == "merge":
+        # يجمع حسابات المالك (لو ربطت أكثر من جهاز قبل 1.5.0) في حساب واحد
+        with LOCK:
+            data = load(USERS, {"users": []})
+            owners = sorted([u for u in data["users"] if u["role"] == "owner" and not u.get("review")],
+                            key=lambda u: u.get("created", 0))
+            if len(owners) < 2:
+                print("عندك حساب مالك واحد بس. ما فيه شي ينجمع.")
+                sys.exit(0)
+            main = owners[0]
+            convs, seen = [], set()
+            for u in owners:
+                bpath = os.path.join(BACKUPS, re.sub(r"[^0-9a-f]", "", u["id"]) + ".json")
+                if os.path.exists(bpath):
+                    try:
+                        for c in json.load(open(bpath)).get("conversations", []):
+                            key = min((m.get("createdAt", 0) for m in c.get("messages", [])), default=0)
+                            if key not in seen:
+                                seen.add(key)
+                                convs.append(c)
+                    except ValueError:
+                        pass
+                if u is main:
+                    continue
+                main["extra_tokens"] = (main.get("extra_tokens", []) + [u["token_hash"]] + u.get("extra_tokens", []))[-10:]
+                lines = [l for l in main.get("memory", "").splitlines() if l.strip()]
+                for l in u.get("memory", "").splitlines():
+                    if l.strip() and l.strip() not in lines:
+                        lines.append(l.strip())
+                main["memory"] = "\n".join(lines)[:MAX_MEMORY]
+                main["push"] = (main.get("push", []) + [t for t in u.get("push", [])
+                                                         if t["token"] not in {x["token"] for x in main.get("push", [])}])[-5:]
+                main["display_name"] = main.get("display_name") or u.get("display_name", "")
+                main["devices"] = (main.get("devices", []) + [{"name": u.get("device") or u["name"], "at": u.get("created", 0)}])[-10:]
+                if os.path.exists(os.path.join(BACKUPS, u["id"] + ".json")):
+                    os.remove(os.path.join(BACKUPS, u["id"] + ".json"))
+                data["users"].remove(u)
+            if convs:
+                os.makedirs(BACKUPS, exist_ok=True)
+                with open(os.path.join(BACKUPS, main["id"] + ".json"), "w") as f:
+                    json.dump({"app": "mosaadi", "version": 1, "exported": int(time.time() * 1000),
+                               "device": "gateway", "conversations": convs}, f, ensure_ascii=False)
+            save(USERS, data)
+        print("تم ✓ صار عندك حساب واحد لـ %d أجهزة. افتح التطبيق في كل جهاز ← الإعدادات ← النسخ والمزامنة ← زامن الحين." % len(owners))
 
     elif cmd == "users":
         for u in load(USERS, {"users": []})["users"]:
