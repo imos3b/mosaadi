@@ -13,13 +13,16 @@
   python3 gateway.py enable <الاسم>    يرجّع شخص
   python3 gateway.py review [أيام|off] حساب مؤقت لمراجعة Apple
   python3 gateway.py version          نسخة البوابة
+  python3 gateway.py push-setup <ملف.p8> <Key ID> <Team ID>   تنبيهات الآيفون (مرة وحدة)
+  python3 gateway.py push-test        يرسل تنبيه تجربة لأجهزتك
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
+import base64
 import hashlib
 import hmac
 import http.client
@@ -119,7 +122,7 @@ def claude_used(u):
 
 def public(u):
     """اللي نرجّعه للتطبيق: بدون المفتاح ومفتاح Claude الخاص."""
-    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at", "learned")}
+    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at", "learned", "push")}
     out.setdefault("paired", True)
     out["claude_limit"] = u.get("claude_limit", CLAUDE_DEFAULT_LIMIT)
     out["claude_used"] = claude_used(u)
@@ -295,6 +298,12 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.learn(u)
             if path == "/gateway/me/backup":
                 return self.backup(u, method)
+            if path == "/gateway/me/name" and method == "POST":
+                return self.set_name(u)
+            if path == "/gateway/me/push" and method == "POST":
+                return self.register_push(u)
+            if path.startswith("/gateway/jobs/"):
+                return self.job_api(u, method, path)
             if path == "/gateway/pair-code" and method == "POST":
                 if u["role"] != "owner":
                     return self.error(403, "للمالك بس.")
@@ -372,6 +381,8 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.reply(200, tags)
             return self.error(status, "Ollama رد بخطأ.")
 
+        if rest == "/api/chat" and method == "POST" and data and json.loads(data).get("stream", True) is not False:
+            return self.chat_job(u, upstream, data)
         if rest in ("/api/chat", "/api/generate"):
             # نعدّ المحادثات الشغالة: التعلّم ينتظر لين Ollama يفضى
             with BUSY_LOCK:
@@ -383,6 +394,90 @@ class Gateway(BaseHTTPRequestHandler):
                     BUSY["active"] -= 1
                     BUSY["last"] = time.time()
         return self.proxy(method, upstream, rest, data)
+
+    # ── الرد يشتغل على الماك حتى لو الجوال انقطع (يطلع من التطبيق، تتغيّر الشبكة…) ──
+    def chat_job(self, u, upstream, data):
+        title = urllib.parse.unquote(self.headers.get("X-Chat-Title", ""))[:80]
+        job = Job(u["id"], title, self.headers.get("X-Conversation", "")[:64])
+        with JOBS_LOCK:
+            for jid in [k for k, j in JOBS.items() if time.time() - j.created > JOB_TTL]:
+                JOBS.pop(jid, None)
+            JOBS[job.id] = job
+        threading.Thread(target=job.run, args=(upstream, data), daemon=True).start()
+        with job.cond:
+            job.cond.wait_for(lambda: job.status is not None or job.done, timeout=600)
+        self.send_response(job.status or 502)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("X-Job-Id", job.id)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        i = 0
+        try:
+            while True:
+                with job.cond:
+                    job.cond.wait_for(lambda: len(job.lines) > i or job.done, timeout=30)
+                    new = job.lines[i:]
+                    i += len(new)
+                    finished = job.done and i >= len(job.lines)
+                for line in new:
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(line), line))
+                self.wfile.flush()
+                if finished:
+                    break
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except OSError:
+            if self.headers.get("X-Keep-Running") != "1":
+                job.cancel()      # تطبيق قديم: الانقطاع معناه «أوقف» زي قبل
+                return
+            job.detached = True   # الجوال راح: الرد يكمّل، ولما يخلص ينرسل تنبيه
+            if job.done:
+                job.after_done()
+
+    def job_api(self, u, method, path):
+        parts = path[len("/gateway/jobs/"):].split("/")
+        with JOBS_LOCK:
+            job = JOBS.get(parts[0])
+        if not job or job.user != u["id"]:
+            return self.error(404, "الرد هذا مو موجود (يمكن البوابة أعادت التشغيل).")
+        if method == "DELETE":
+            job.cancel()
+            return self.reply(200, {"cancelled": True})
+        if len(parts) > 1 and parts[1] == "notify" and method == "POST":
+            # التطبيق راح للخلفية: أول ما يخلص الرد ارسل تنبيه
+            job.notify = True
+            if job.done:
+                job.after_done()
+            return self.reply(200, {"done": job.done})
+        return self.reply(200, job.state())
+
+    def set_name(self, u):
+        name = str(json.loads(self.body() or b"{}").get("name", "")).strip()[:30]
+        with LOCK:
+            data = load(USERS, {"users": []})
+            for x in data["users"]:
+                if x["id"] == u["id"]:
+                    if name:
+                        x["display_name"] = name
+                    else:
+                        x.pop("display_name", None)
+            save(USERS, data)
+        return self.reply(200, {"name": name})
+
+    def register_push(self, u):
+        req = json.loads(self.body() or b"{}")
+        token = re.sub(r"[^0-9a-fA-F]", "", str(req.get("token", "")))
+        env = "sandbox" if req.get("env") == "sandbox" else "production"
+        if not 32 <= len(token) <= 200:
+            return self.error(400, "رمز التنبيهات غلط.")
+        with LOCK:
+            data = load(USERS, {"users": []})
+            for x in data["users"]:
+                if x["id"] == u["id"]:
+                    tokens = [t for t in x.get("push", []) if t["token"] != token]
+                    x["push"] = (tokens + [{"token": token, "env": env}])[-5:]
+            save(USERS, data)
+        return self.reply(200, {"push": bool(load(CONFIG, {}).get("apns"))})
 
     # ── تمرير الطلب (مع البث كلمة كلمة) ──
     def fetch(self, upstream, rest):
@@ -762,6 +857,197 @@ LEARN_PROMPT = """مهمتك تطلّع من المحادثة معلومات ث�
 كل جملة بالعربي، قصيرة، بصيغة الغائب (مثل: يشتغل مطوّر تطبيقات). لو ما فيه شي جديد يستاهل: {"facts": []}"""
 
 
+# ── الردود بالخلفية ──
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+JOB_TTL = 6 * 3600
+
+
+class Job:
+    """رد واحد: يقرا من Ollama ويحفظ كل سطر، وأي اتصال (أو إعادة اتصال) يقرا منه."""
+
+    def __init__(self, user, title, conversation):
+        self.id = secrets.token_hex(8)
+        self.user = user
+        self.title = title
+        self.conversation = conversation
+        self.created = time.time()
+        self.cond = threading.Condition()
+        self.lines = []
+        self.status = None
+        self.done = False
+        self.error = None
+        self.content = []
+        self.thinking = []
+        self.final = {}
+        self.notify = False
+        self.detached = False
+        self.cancelled = False
+        self.pushed = False
+        self.conn = None
+
+    def run(self, upstream, data):
+        with BUSY_LOCK:
+            BUSY["active"] += 1
+        try:
+            target = urllib.parse.urlsplit(upstream)
+            self.conn = http.client.HTTPConnection(target.hostname, target.port or 80, timeout=600)
+            self.conn.request("POST", target.path.rstrip("/") + "/api/chat", body=data,
+                              headers={"Content-Type": "application/json"})
+            r = self.conn.getresponse()
+            with self.cond:
+                self.status = r.status
+                self.cond.notify_all()
+            buf = b""
+            while not self.cancelled:
+                chunk = r.read1(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while b"\n" in buf:
+                    line, buf = buf.split(b"\n", 1)
+                    if line.strip():
+                        self.add(line + b"\n")
+            if buf.strip():
+                self.add(buf.strip() + b"\n")
+        except Exception as e:
+            if not self.cancelled:
+                self.error = "البوابة ما قدرت تكمّل مع Ollama: %s" % e
+                with self.cond:
+                    if self.status is None:
+                        self.status = 502
+                self.add(json.dumps({"error": self.error}, ensure_ascii=False).encode() + b"\n")
+        finally:
+            with BUSY_LOCK:
+                BUSY["active"] -= 1
+                BUSY["last"] = time.time()
+            try:
+                self.conn and self.conn.close()
+            except Exception:
+                pass
+            with self.cond:
+                self.done = True
+                self.cond.notify_all()
+            self.after_done()
+
+    def add(self, line):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            d = {}
+        msg = d.get("message") or {}
+        with self.cond:
+            if msg.get("content"):
+                self.content.append(msg["content"])
+            if msg.get("thinking"):
+                self.thinking.append(msg["thinking"])
+            if d.get("error"):
+                self.error = d["error"]
+            if d.get("done"):
+                self.final = {k: d.get(k) for k in ("done_reason", "eval_count", "eval_duration", "total_duration")}
+            self.lines.append(line)
+            self.cond.notify_all()
+
+    def cancel(self):
+        self.cancelled = True
+        try:
+            self.conn and self.conn.sock and self.conn.sock.shutdown(2)   # Ollama يوقف الكتابة
+        except Exception:
+            pass
+
+    def state(self):
+        with self.cond:
+            return dict(self.final, id=self.id, done=self.done, error=self.error,
+                        content="".join(self.content), thinking="".join(self.thinking))
+
+    def after_done(self):
+        """لو أحد طلب تنبيه (أو الجوال انقطع): نرسله مرة وحدة."""
+        if self.pushed or self.cancelled or not (self.notify or self.detached):
+            return
+        self.pushed = True
+        text = re.sub(r"[#*`>_\[\]]", "", "".join(self.content)).strip()
+        if self.error and not text:
+            body = "ما اكتمل الرد. افتح المحادثة وجرّب مرة ثانية."
+        else:
+            body = re.sub(r"\s+", " ", text)[:180] or "الرد جاهز"
+        threading.Thread(target=send_push, args=(self.user, self.title or "الرد جاهز", body,
+                                                  {"conversation": self.conversation, "job": self.id}),
+                         daemon=True).start()
+
+
+# ── تنبيهات الآيفون (Apple Push) ──
+_APNS_JWT = [None, 0]
+
+
+def _b64url(b):
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+
+
+def _der_to_raw(der):
+    """توقيع openssl (DER) ← الصيغة اللي تبيها Apple (r||s، 64 بايت)."""
+    i = 2 if der[1] < 0x80 else 2 + (der[1] & 0x7F)
+    out = b""
+    for _ in range(2):
+        n = der[i + 1]
+        v = der[i + 2:i + 2 + n].lstrip(b"\x00")
+        out += v.rjust(32, b"\x00")
+        i += 2 + n
+    return out
+
+
+def apns_jwt(apns):
+    if _APNS_JWT[0] and time.time() - _APNS_JWT[1] < 2400:
+        return _APNS_JWT[0]
+    head = _b64url(json.dumps({"alg": "ES256", "kid": apns["key_id"]}).encode())
+    claims = _b64url(json.dumps({"iss": apns["team_id"], "iat": int(time.time())}).encode())
+    msg = (head + "." + claims).encode()
+    der = subprocess.run(["openssl", "dgst", "-sha256", "-sign", os.path.join(HOME, "apns.p8")],
+                         input=msg, capture_output=True, check=True).stdout
+    token = msg.decode() + "." + _b64url(_der_to_raw(der))
+    _APNS_JWT[:] = [token, time.time()]
+    return token
+
+
+def send_push(user_id, title, body, extra=None):
+    """يرسل لكل أجواله (الآيفون). يرجع كم وصل."""
+    apns = load(CONFIG, {}).get("apns")
+    u = find_user_by_id(user_id)
+    if not apns or not u or not u.get("push"):
+        return 0
+    payload = json.dumps(dict(extra or {}, aps={
+        "alert": {"title": title, "body": body}, "sound": "default",
+        "thread-id": (extra or {}).get("conversation") or "chat"}), ensure_ascii=False).encode()
+    sent, dead = 0, []
+    for t in u["push"]:
+        host = "api.sandbox.push.apple.com" if t.get("env") == "sandbox" else "api.push.apple.com"
+        try:
+            r = subprocess.run(
+                ["curl", "-sS", "--http2", "-m", "20", "-w", "\n%{http_code}",
+                 "-H", "authorization: bearer " + apns_jwt(apns),
+                 "-H", "apns-topic: " + apns.get("topic", "com.imosaab.mosaadi"),
+                 "-H", "apns-push-type: alert", "-H", "apns-priority: 10",
+                 "--data-binary", "@-", "https://%s/3/device/%s" % (host, t["token"])],
+                input=payload, capture_output=True, timeout=30)
+            out = r.stdout.decode(errors="replace").rsplit("\n", 1)
+            code = out[-1].strip()
+            if code == "200":
+                sent += 1
+            elif code == "410" or "BadDeviceToken" in out[0] or "Unregistered" in out[0]:
+                dead.append(t["token"])
+            else:
+                sys.stderr.write("push failed %s: %s %s\n" % (code, out[0], r.stderr.decode(errors="replace")))
+        except Exception as e:
+            sys.stderr.write("push failed: %s\n" % e)
+    if dead:
+        with LOCK:
+            data = load(USERS, {"users": []})
+            for x in data["users"]:
+                if x["id"] == user_id:
+                    x["push"] = [t for t in x.get("push", []) if t["token"] not in dead]
+            save(USERS, data)
+    return sent
+
+
 # ── التعلّم بالخلفية ──
 BUSY = {"active": 0, "last": 0.0}
 BUSY_LOCK = threading.Lock()
@@ -904,6 +1190,37 @@ def main():
 
     elif cmd == "version":
         print(VERSION)
+
+    elif cmd == "push-setup":
+        if len(sys.argv) < 5:
+            print("الاستخدام: python3 gateway.py push-setup ~/Downloads/AuthKey_XXXX.p8 <Key ID> <Team ID>")
+            sys.exit(1)
+        src = os.path.expanduser(sys.argv[2])
+        if not os.path.exists(src):
+            print("ما لقيت الملف: " + src)
+            sys.exit(1)
+        os.makedirs(HOME, exist_ok=True)
+        shutil.copyfile(src, os.path.join(HOME, "apns.p8"))
+        os.chmod(os.path.join(HOME, "apns.p8"), 0o600)
+        with LOCK:
+            cfg = load(CONFIG, {})
+            cfg["apns"] = {"key_id": sys.argv[3].strip(), "team_id": sys.argv[4].strip(),
+                           "topic": "com.imosaab.mosaadi"}
+            save(CONFIG, cfg)
+        try:
+            apns_jwt(cfg["apns"])
+            print("تم ✓ التنبيهات جاهزة. افتح التطبيق في الآيفون مرة عشان يسجّل، وبعدين: python3 gateway.py push-test")
+        except Exception as e:
+            print("الملف ما اشتغل (تأكد إنه ملف .p8 من Apple): %s" % e)
+
+    elif cmd == "push-test":
+        data = load(USERS, {"users": []})
+        total = 0
+        for x in data["users"]:
+            if x["role"] == "owner" and x.get("push"):
+                total += send_push(x["id"], "مساعدي", "تجربة ✓ التنبيهات شغالة")
+        print("وصل لـ %d جهاز." % total if total else
+              "ما وصل لأي جهاز. افتح التطبيق في الآيفون (بعد التحديث) واسمح بالتنبيهات، وجرّب مرة ثانية.")
 
     elif cmd == "wake-setup":
         url = sys.argv[2] if len(sys.argv) > 2 else ""
