@@ -13,13 +13,14 @@
   python3 gateway.py enable <الاسم>    يرجّع شخص
   python3 gateway.py review [أيام|off] حساب مؤقت لمراجعة Apple
   python3 gateway.py version          نسخة البوابة
+  python3 gateway.py brief [send]     ملخص الصباح الحين (send = يرسله تنبيه)
   python3 gateway.py merge            يجمع أجهزتك (المالك) في حساب واحد: نفس المحادثات والذاكرة
   python3 gateway.py push-setup <ملف.p8> <Key ID> <Team ID>   تنبيهات الآيفون (مرة وحدة)
   python3 gateway.py push-test        يرسل تنبيه تجربة لأجهزتك
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -319,6 +320,8 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.set_name(u)
             if path == "/gateway/me/push" and method == "POST":
                 return self.register_push(u)
+            if path == "/gateway/brief":
+                return self.brief_api(u, method)
             if path.startswith("/gateway/jobs/"):
                 return self.job_api(u, method, path)
             if path == "/gateway/pair-code" and method == "POST":
@@ -417,8 +420,10 @@ class Gateway(BaseHTTPRequestHandler):
     def chat_job(self, u, upstream, data):
         title = urllib.parse.unquote(self.headers.get("X-Chat-Title", ""))[:80]
         job = Job(u["id"], title, self.headers.get("X-Conversation", "")[:64])
+        job.temporary = self.headers.get("X-Temporary") == "1"
         with JOBS_LOCK:
-            for jid in [k for k, j in JOBS.items() if time.time() - j.created > JOB_TTL]:
+            for jid in [k for k, j in JOBS.items()
+                        if time.time() - j.created > (JOB_TTL_TEMP if j.temporary else JOB_TTL)]:
                 JOBS.pop(jid, None)
             JOBS[job.id] = job
         threading.Thread(target=job.run, args=(upstream, data), daemon=True).start()
@@ -444,6 +449,8 @@ class Gateway(BaseHTTPRequestHandler):
                     break
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
+            if job.temporary:
+                job.forget()   # محادثة مؤقتة: وصل الرد كامل، فما نخلي منه نسخة
         except OSError:
             if self.headers.get("X-Keep-Running") != "1":
                 job.cancel()      # تطبيق قديم: الانقطاع معناه «أوقف» زي قبل
@@ -461,6 +468,10 @@ class Gateway(BaseHTTPRequestHandler):
         if method == "DELETE":
             job.cancel()
             return self.reply(200, {"cancelled": True})
+        if method == "GET" and len(parts) == 1 and job.temporary and job.done:
+            state = job.state()
+            job.forget()
+            return self.reply(200, state)
         if len(parts) > 1 and parts[1] == "notify" and method == "POST":
             # التطبيق راح للخلفية: أول ما يخلص الرد ارسل تنبيه
             job.notify = True
@@ -468,6 +479,28 @@ class Gateway(BaseHTTPRequestHandler):
                 job.after_done()
             return self.reply(200, {"done": job.done})
         return self.reply(200, job.state())
+
+    # ── ملخص الصباح ──
+    def brief_api(self, u, method):
+        if not has(u, "servers"):
+            return self.error(403, "ما عندك صلاحية السيرفرات.")
+        if method == "POST":
+            if u["role"] != "owner":
+                return self.error(403, "للمالك بس.")
+            req = json.loads(self.body() or b"{}")
+            with LOCK:
+                cfg = load(CONFIG, {})
+                b = cfg.setdefault("brief", {"enabled": True, "time": "07:00"})
+                if "enabled" in req:
+                    b["enabled"] = bool(req["enabled"])
+                if re.fullmatch(r"\d{1,2}:\d{2}", str(req.get("time", ""))):
+                    h, m = map(int, req["time"].split(":"))
+                    b["time"] = "%02d:%02d" % (h % 24, m % 60)
+                save(CONFIG, cfg)
+        if "now" in urllib.parse.urlsplit(self.path).query:
+            return self.reply(200, dict(build_brief(), settings=brief_settings()))
+        latest = load(BRIEF, {})
+        return self.reply(200, dict(latest, settings=brief_settings()))
 
     def set_name(self, u):
         name = str(json.loads(self.body() or b"{}").get("name", "")).strip()[:30]
@@ -928,6 +961,7 @@ LEARN_PROMPT = """مهمتك تطلّع من المحادثة معلومات ث�
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 JOB_TTL = 6 * 3600
+JOB_TTL_TEMP = 15 * 60   # المؤقتة: لو ما رجع لها أحد، تنمسح بعد ربع ساعة
 
 
 class Job:
@@ -951,6 +985,7 @@ class Job:
         self.detached = False
         self.cancelled = False
         self.pushed = False
+        self.temporary = False   # محادثة مؤقتة: ما نخلي منها نسخة بعد ما توصل
         self.conn = None
 
     def run(self, upstream, data):
@@ -1027,13 +1062,24 @@ class Job:
             return dict(self.final, id=self.id, done=self.done, error=self.error,
                         content="".join(self.content), thinking="".join(self.thinking))
 
+    def forget(self):
+        """يمسح محتوى الرد من البوابة (للمحادثة المؤقتة)."""
+        with self.cond:
+            self.lines, self.content, self.thinking = [], [], []
+        with JOBS_LOCK:
+            JOBS.pop(self.id, None)
+
     def after_done(self):
         """لو أحد طلب تنبيه (أو الجوال انقطع): نرسله مرة وحدة."""
         if self.pushed or self.cancelled or not (self.notify or self.detached):
             return
         self.pushed = True
         text = re.sub(r"[#*`>_\[\]]", "", "".join(self.content)).strip()
-        if self.error and not text:
+        if self.temporary:
+            # المحادثة المؤقتة: التنبيه ما يبين شي من الرد (ولا العنوان)
+            self.title = "مساعدي"
+            body = "الرد جاهز في المحادثة المؤقتة"
+        elif self.error and not text:
             body = "ما اكتمل الرد. افتح المحادثة وجرّب مرة ثانية."
         else:
             body = re.sub(r"\s+", " ", text)[:180] or "الرد جاهز"
@@ -1113,6 +1159,105 @@ def send_push(user_id, title, body, extra=None):
                     x["push"] = [t for t in x.get("push", []) if t["token"] not in dead]
             save(USERS, data)
     return sent
+
+
+# ── ملخص الصباح: كل يوم يجمع حالة السيرفرات والأقراص، ويرسلها تنبيه ──
+BRIEF = os.path.join(HOME, "brief.json")
+
+
+def brief_settings():
+    b = load(CONFIG, {}).get("brief") or {}
+    return {"enabled": b.get("enabled", True), "time": b.get("time", "07:00")}
+
+
+def _get_json(url, timeout=8):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def build_brief():
+    cfg = load(CONFIG, {})
+    up = cfg.get("upstreams", {})
+    lines, stats = [], {}
+
+    # السيرفرات (Uptime Kuma)
+    slug = (cfg.get("shared") or {}).get("kuma_slug")
+    if up.get("kuma") and slug:
+        try:
+            base = up["kuma"].rstrip("/")
+            page = _get_json("%s/api/status-page/%s" % (base, slug))
+            names = {m["id"]: m["name"] for g in page.get("publicGroupList", []) for m in g.get("monitorList", [])}
+            beats = _get_json("%s/api/status-page/heartbeat/%s" % (base, slug)).get("heartbeatList", {})
+            since = time.time() - 12 * 3600
+            down_now, night = [], []
+            for mid, name in names.items():
+                hb = beats.get(str(mid)) or []
+                if hb and hb[-1].get("status") != 1:
+                    down_now.append(name)
+                bad = 0
+                for h in hb:
+                    try:
+                        t = time.mktime(time.strptime(h["time"][:19], "%Y-%m-%d %H:%M:%S")) - time.timezone
+                    except (KeyError, ValueError):
+                        continue
+                    if t >= since and h.get("status") == 0:
+                        bad += 1
+                if bad and name not in down_now:
+                    night.append(name)
+            stats["servers_up"] = len(names) - len(down_now)
+            stats["servers_total"] = len(names)
+            if down_now:
+                lines.append("⚠️ واقف الحين: " + "، ".join(down_now))
+            else:
+                lines.append("✅ كل السيرفرات شغالة (%d)" % len(names))
+            if night:
+                lines.append("بالليل وقف شوي ورجع: " + "، ".join(night))
+        except Exception as e:
+            lines.append("ما قدرت أوصل لـ Uptime Kuma (%s)" % type(e).__name__)
+
+    # الـ NAS
+    if up.get("nas"):
+        try:
+            fs = _get_json(up["nas"].rstrip("/") + "/api/4/fs")
+            vols = [f for f in fs if str(f.get("mnt_point", "")).startswith("/volume")] or fs
+            big = max(vols, key=lambda f: f.get("size", 0))
+            stats["nas_percent"] = round(big.get("percent", 0))
+            lines.append("💾 الـ NAS: %d%% مستخدم" % stats["nas_percent"]
+                         + (" — قرّب يمتلي!" if stats["nas_percent"] >= 85 else ""))
+        except Exception:
+            lines.append("ما قدرت أوصل للـ NAS")
+
+    # الماك
+    try:
+        total, used, free = shutil.disk_usage("/")
+        stats["mac_free_gb"] = round(free / 1024 ** 3)
+        lines.append("🖥️ الماك: فاضي %d GB" % stats["mac_free_gb"])
+    except OSError:
+        pass
+
+    text = "\n".join(lines) or "ما فيه شي أبلّغك عنه."
+    return {"date": time.strftime("%Y-%m-%d"), "at": int(time.time()),
+            "title": "صباح الخير ☀︎ ملخص اليوم", "text": text, "stats": stats}
+
+
+def brief_worker():
+    """يصحى كل نص دقيقة: لو جا الوقت وما انرسل اليوم، يجهّز الملخص ويرسله."""
+    while True:
+        time.sleep(30)
+        try:
+            b = brief_settings()
+            if not b["enabled"] or time.strftime("%H:%M") < b["time"]:
+                continue
+            if load(BRIEF, {}).get("date") == time.strftime("%Y-%m-%d"):
+                continue
+            brief = build_brief()
+            save(BRIEF, brief)
+            short = re.sub(r"\s+", " ", brief["text"].replace("\n", " · "))[:180]
+            for x in load(USERS, {"users": []})["users"]:
+                if x.get("push") and has(x, "servers") and not x.get("disabled"):
+                    send_push(x["id"], brief["title"], short, {"brief": True})
+        except Exception as e:
+            sys.stderr.write("brief failed: %s\n" % e)
 
 
 # ── التعلّم بالخلفية ──
@@ -1252,6 +1397,7 @@ def main():
         server = ThreadingHTTPServer((host, port), Gateway)
         server.daemon_threads = True
         threading.Thread(target=learn_worker, daemon=True).start()
+        threading.Thread(target=brief_worker, daemon=True).start()
         print("البوابة شغالة على %s:%d" % (host, port), flush=True)
         server.serve_forever()
 
@@ -1350,6 +1496,16 @@ def main():
         # الرمز في سطر لحاله وبدون مسافات: لو انطبع جنب كلام عربي، الترمنال في الجوال يقلب ترتيب الأرقام
         print("\n  رمز الربط (يصلح 10 دقايق):\n\n      %s\n" % code)
         print("  في التطبيق: الإعدادات ← البوابة ← اكتب الرمز. يصلح 10 دقايق.\n")
+
+    elif cmd == "brief":
+        # يطبع ملخص الصباح الحين (للتجربة). مع "send" يرسله تنبيه بعد.
+        b = build_brief()
+        print(b["title"] + "\n" + b["text"])
+        if len(sys.argv) > 2 and sys.argv[2] == "send":
+            save(BRIEF, b)
+            n = sum(send_push(x["id"], b["title"], b["text"].replace("\n", " · ")[:180], {"brief": True})
+                    for x in load(USERS, {"users": []})["users"] if x.get("push") and has(x, "servers"))
+            print("انرسل لـ %d جهاز." % n)
 
     elif cmd == "merge":
         # يجمع حسابات المالك (لو ربطت أكثر من جهاز قبل 1.5.0) في حساب واحد
