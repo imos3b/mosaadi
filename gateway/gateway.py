@@ -20,13 +20,15 @@
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
 import base64
 import hashlib
 import hmac
+import html as htmllib
+import io
 import http.client
 import json
 import os
@@ -39,6 +41,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HOME = os.path.expanduser("~/Library/Application Support/PrivateAI-Gateway")
@@ -322,6 +325,8 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.register_push(u)
             if path == "/gateway/brief":
                 return self.brief_api(u, method)
+            if path == "/gateway/extract" and method == "POST":
+                return self.extract_api(u)
             if path.startswith("/gateway/jobs/"):
                 return self.job_api(u, method, path)
             if path == "/gateway/pair-code" and method == "POST":
@@ -417,6 +422,22 @@ class Gateway(BaseHTTPRequestHandler):
                     BUSY["active"] -= 1
                     BUSY["last"] = time.time()
         return self.proxy(method, upstream, rest, data)
+
+    # ── نص أي ملف (Word / Excel / PowerPoint / EPUB / HTML …) للتطبيق ──
+    def extract_api(self, u):
+        if not has(u, "chat"):
+            return self.error(403, "ما عندك صلاحية.")
+        n = int(self.headers.get("Content-Length") or 0)
+        if n > 25_000_000:
+            return self.error(413, "الملف كبير (أكثر من 25MB).")
+        name = urllib.parse.unquote(self.headers.get("X-Filename", "file"))[:200]
+        try:
+            text, pages = extract_text(name, self.body())
+        except Exception as e:
+            return self.error(422, "ما قدرت أقرأ الملف: %s" % e)
+        if not text.strip():
+            return self.error(422, "الملف ما فيه نص أقدر أقراه.")
+        return self.reply(200, {"name": name, "text": text[:300_000], "pages": pages})
 
     # ── تنزيل موديل: يكمّل على الماك حتى لو الجوال انقطع، ولو رجعت تشوف نفس التقدّم ──
     def pull_stream(self, upstream, data):
@@ -1119,6 +1140,106 @@ class Job:
         threading.Thread(target=send_push, args=(self.user, self.title or "الرد جاهز", body,
                                                   {"conversation": self.conversation, "job": self.id}),
                          daemon=True).start()
+
+
+# ── استخراج النص من الملفات (مكتبة Python العادية بس) ──
+def _xml_text(xml, para_tags=("w:p", "a:p", "text:p", "text:h", "p", "div", "br", "li", "tr", "h1", "h2", "h3")):
+    xml = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", xml)
+    for t in para_tags:
+        xml = re.sub(r"(?i)</%s>|<%s\s*/>" % (re.escape(t), re.escape(t)), "\n", xml)
+    xml = re.sub(r"(?i)<w:tab\s*/>|<text:tab\s*/>", "\t", xml)
+    xml = re.sub(r"(?i)<w:br\s*/>|<a:br\s*/>|<text:line-break\s*/>", "\n", xml)
+    txt = htmllib.unescape(re.sub(r"<[^>]+>", "", xml))
+    txt = re.sub(r"[ \t\u00a0]+", " ", txt)
+    return re.sub(r"\n\s*\n\s*\n+", "\n\n", txt).strip()
+
+
+def _num(name):
+    m = re.search(r"(\d+)", name)
+    return int(m.group(1)) if m else 0
+
+
+def extract_text(name, data):
+    """يرجّع (النص، عدد الصفحات/الشرائح/الأوراق)."""
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext in ("docx", "docm", "dotx", "xlsx", "xlsm", "pptx", "pptm", "epub", "odt", "ods", "odp"):
+        z = zipfile.ZipFile(io.BytesIO(data))
+        names = z.namelist()
+        read = lambda n: z.read(n).decode("utf-8", "replace")
+        if ext.startswith("doc"):
+            parts = ["word/document.xml"] + sorted(n for n in names if re.match(r"word/(footnotes|endnotes)\.xml", n))
+            return "\n\n".join(_xml_text(read(n)) for n in parts if n in names), 1
+        if ext.startswith("ppt"):
+            slides = sorted((n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)), key=_num)
+            out = []
+            for i, n in enumerate(slides, 1):
+                notes = "ppt/notesSlides/notesSlide%d.xml" % _num(n)
+                body = _xml_text(read(n))
+                if notes in names:
+                    nt = _xml_text(read(notes))
+                    if nt:
+                        body += "\n(ملاحظات: %s)" % nt
+                out.append("── شريحة %d ──\n%s" % (i, body))
+            return "\n\n".join(out), len(slides)
+        if ext.startswith("xls"):
+            shared = []
+            if "xl/sharedStrings.xml" in names:
+                for si in re.findall(r"(?s)<si>(.*?)</si>", read("xl/sharedStrings.xml")):
+                    shared.append(htmllib.unescape("".join(re.findall(r"(?s)<t[^>]*>(.*?)</t>", si))))
+            wb = read("xl/workbook.xml") if "xl/workbook.xml" in names else ""
+            titles = re.findall(r'<sheet [^>]*name="([^"]+)"', wb)
+            sheets = sorted((n for n in names if re.match(r"xl/worksheets/sheet\d+\.xml$", n)), key=_num)
+            out, total = [], 0
+            for i, n in enumerate(sheets):
+                rows = []
+                for row in re.findall(r"(?s)<row[^>]*>(.*?)</row>", read(n)):
+                    cells = []
+                    for attrs, inner in re.findall(r"(?s)<c([^>]*)>(.*?)</c>", row):
+                        v = re.search(r"(?s)<v>(.*?)</v>", inner)
+                        isv = re.search(r"(?s)<is>.*?<t[^>]*>(.*?)</t>", inner)
+                        if 't="s"' in attrs and v:
+                            try:
+                                cells.append(shared[int(v.group(1))])
+                            except (ValueError, IndexError):
+                                cells.append("")
+                        elif isv:
+                            cells.append(htmllib.unescape(isv.group(1)))
+                        else:
+                            cells.append(htmllib.unescape(v.group(1)) if v else "")
+                    if any(c.strip() for c in cells):
+                        rows.append(" | ".join(c.replace("\n", " ") for c in cells))
+                    total += 1
+                    if total > 5000:
+                        break
+                title = titles[i] if i < len(titles) else "ورقة %d" % (i + 1)
+                out.append("── %s ──\n%s" % (title, "\n".join(rows)))
+            return "\n\n".join(out), len(sheets)
+        if ext == "epub":
+            opf = next((n for n in names if n.endswith(".opf")), None)
+            order = []
+            if opf:
+                o = read(opf)
+                base = opf.rsplit("/", 1)[0] + "/" if "/" in opf else ""
+                items = dict(re.findall(r'<item [^>]*id="([^"]+)"[^>]*href="([^"]+)"', o))
+                items.update({k: v for v, k in re.findall(r'<item [^>]*href="([^"]+)"[^>]*id="([^"]+)"', o)})
+                order = [base + urllib.parse.unquote(items[i]) for i in re.findall(r'<itemref [^>]*idref="([^"]+)"', o) if i in items]
+            order = [n for n in order if n in names] or sorted(n for n in names if n.endswith((".xhtml", ".html", ".htm")))
+            return "\n\n".join(_xml_text(read(n)) for n in order), len(order)
+        # OpenDocument
+        return _xml_text(read("content.xml")), 1
+    text = data.decode("utf-8", "replace")
+    if ext == "rtf":
+        text = re.sub(r"\\'([0-9a-f]{2})", lambda m: bytes.fromhex(m.group(1)).decode("cp1256", "replace"), text)
+        text = re.sub(r"\\u(-?\d+)\??", lambda m: chr(int(m.group(1)) % 65536), text)
+        text = re.sub(r"\\par[d]?\b", "\n", text)
+        text = re.sub(r"\\[a-zA-Z]+-?\d* ?|[{}]", "", text)
+        return text.strip(), 1
+    if ext in ("html", "htm", "xhtml", "xml", "svg"):
+        return _xml_text(text), 1
+    # نص عادي؟ (مو ملف ثنائي)
+    if data[:4000].count(b"\x00") == 0:
+        return text, 1
+    raise ValueError("هالنوع ما أعرف أقراه (%s)" % (ext or "بدون امتداد"))
 
 
 # ── تنزيلات الموديلات بالخلفية ──
