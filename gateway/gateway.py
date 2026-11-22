@@ -20,7 +20,7 @@
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -402,6 +402,8 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.reply(200, tags)
             return self.error(status, "Ollama رد بخطأ.")
 
+        if rest == "/api/pull" and method == "POST" and data:
+            return self.pull_stream(upstream, data)
         if rest == "/api/chat" and method == "POST" and data and json.loads(data).get("stream", True) is not False:
             return self.chat_job(u, upstream, data)
         if rest in ("/api/chat", "/api/generate"):
@@ -415,6 +417,37 @@ class Gateway(BaseHTTPRequestHandler):
                     BUSY["active"] -= 1
                     BUSY["last"] = time.time()
         return self.proxy(method, upstream, rest, data)
+
+    # ── تنزيل موديل: يكمّل على الماك حتى لو الجوال انقطع، ولو رجعت تشوف نفس التقدّم ──
+    def pull_stream(self, upstream, data):
+        model = str(json.loads(data or b"{}").get("model") or json.loads(data or b"{}").get("name") or "").strip()
+        if not model:
+            return self.error(400, "اسم الموديل فاضي.")
+        p = start_pull(upstream, model)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        i = 0
+        try:
+            while True:
+                with p["cond"]:
+                    p["cond"].wait_for(lambda: len(p["lines"]) > i or p["done"], timeout=20)
+                    new = p["lines"][i:]
+                    i += len(new)
+                    finished = p["done"] and i >= len(p["lines"])
+                    # الخط القديم ما يهم: نرسل آخر سطر بس (يكفي للتقدّم)
+                    if len(new) > 1:
+                        new = new[-1:]
+                for line in new:
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(line), line))
+                self.wfile.flush()
+                if finished:
+                    break
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+        except OSError:
+            pass   # الجوال راح: التنزيل مكمّل بالخلفية
 
     # ── الرد يشتغل على الماك حتى لو الجوال انقطع (يطلع من التطبيق، تتغيّر الشبكة…) ──
     def chat_job(self, u, upstream, data):
@@ -1086,6 +1119,61 @@ class Job:
         threading.Thread(target=send_push, args=(self.user, self.title or "الرد جاهز", body,
                                                   {"conversation": self.conversation, "job": self.id}),
                          daemon=True).start()
+
+
+# ── تنزيلات الموديلات بالخلفية ──
+PULLS = {}
+PULLS_LOCK = threading.Lock()
+
+
+def start_pull(upstream, model):
+    """يبدأ تنزيل (أو يرجّع اللي شغّال لنفس الموديل). Ollama يكمّل من حيث وقف لو انقطع قبل."""
+    with PULLS_LOCK:
+        p = PULLS.get(model)
+        if p and (not p["done"] or time.time() - p["at"] < 5):
+            return p
+        p = {"lines": [], "done": False, "at": time.time(), "cond": threading.Condition()}
+        PULLS[model] = p
+
+    def run():
+        def add(line):
+            with p["cond"]:
+                p["lines"].append(line)
+                del p["lines"][:-50]
+                p["cond"].notify_all()
+        for attempt in range(5):     # النت قطع؟ نعيد (Ollama يكمّل من نفس النقطة)
+            try:
+                r = urllib.request.urlopen(urllib.request.Request(
+                    upstream.rstrip("/") + "/api/pull", data=json.dumps({"model": model, "stream": True}).encode(),
+                    headers={"Content-Type": "application/json"}), timeout=120)
+                ok = False
+                for raw in r:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    add(raw)
+                    try:
+                        st = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if st.get("error"):
+                        attempt = 99
+                        break
+                    if st.get("status") == "success":
+                        ok = True
+                if ok or attempt == 99:
+                    break
+            except Exception as e:
+                if attempt == 4:
+                    add(json.dumps({"error": "التنزيل وقف: %s" % e}).encode())
+                time.sleep(3)
+        with p["cond"]:
+            p["done"] = True
+            p["at"] = time.time()
+            p["cond"].notify_all()
+
+    threading.Thread(target=run, daemon=True).start()
+    return p
 
 
 # ── تنبيهات الآيفون (Apple Push) ──
