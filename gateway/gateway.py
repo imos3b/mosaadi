@@ -20,7 +20,7 @@
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -325,6 +325,8 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.register_push(u)
             if path == "/gateway/brief":
                 return self.brief_api(u, method)
+            if path == "/gateway/studies" and method == "GET":
+                return self.studies_api(u)
             if path == "/gateway/extract" and method == "POST":
                 return self.extract_api(u)
             if path.startswith("/gateway/jobs/"):
@@ -422,6 +424,19 @@ class Gateway(BaseHTTPRequestHandler):
                     BUSY["active"] -= 1
                     BUSY["last"] = time.time()
         return self.proxy(method, upstream, rest, data)
+
+    # ── وضع «دراسات»: أبحاث حقيقية من OpenAlex و PubMed ──
+    def studies_api(self, u):
+        if not has(u, "chat"):
+            return self.error(403, "ما عندك صلاحية.")
+        q = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("q") or [""])[0].strip()[:300]
+        if not q:
+            return self.error(400, "السؤال فاضي.")
+        try:
+            n = max(3, min(int((urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("n") or ["8"])[0]), 15))
+        except ValueError:
+            n = 8
+        return self.reply(200, {"query": q, "studies": find_studies(q, n)})
 
     # ── نص أي ملف (Word / Excel / PowerPoint / EPUB / HTML …) للتطبيق ──
     def extract_api(self, u):
@@ -1140,6 +1155,91 @@ class Job:
         threading.Thread(target=send_push, args=(self.user, self.title or "الرد جاهز", body,
                                                   {"conversation": self.conversation, "job": self.id}),
                          daemon=True).start()
+
+
+# ── البحث في الدراسات (بدون مفاتيح: OpenAlex + PubMed) ──
+STUDIES_UA = "Mosaadi/1.0 (private self-hosted assistant)"
+
+
+def _get_json(url, timeout=15):
+    r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": STUDIES_UA}), timeout=timeout)
+    return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _openalex(q, n):
+    url = "https://api.openalex.org/works?" + urllib.parse.urlencode({
+        "search": q, "per-page": n, "filter": "has_abstract:true,type:article|review",
+        "select": "title,publication_year,primary_location,abstract_inverted_index,doi,id,cited_by_count,type,authorships",
+    })
+    out = []
+    for w in _get_json(url).get("results", []):
+        inv = w.get("abstract_inverted_index") or {}
+        words = sorted((pos, word) for word, positions in inv.items() for pos in positions)
+        abstract = " ".join(word for _, word in words)
+        loc = (w.get("primary_location") or {})
+        venue = ((loc.get("source") or {}).get("display_name")) or ""
+        authors = [((a.get("author") or {}).get("display_name") or "") for a in (w.get("authorships") or [])[:3]]
+        out.append({
+            "title": (w.get("title") or "").strip(), "year": w.get("publication_year"), "venue": venue,
+            "authors": [a for a in authors if a], "abstract": abstract[:2500],
+            "url": w.get("doi") or loc.get("landing_page_url") or w.get("id") or "",
+            "source": "OpenAlex", "cited": w.get("cited_by_count") or 0,
+            "review": w.get("type") == "review",
+        })
+    return out
+
+
+def _pubmed(q, n):
+    base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    ids = _get_json(base + "esearch.fcgi?" + urllib.parse.urlencode(
+        {"db": "pubmed", "term": q, "retmax": n, "retmode": "json", "sort": "relevance"})).get("esearchresult", {}).get("idlist", [])
+    if not ids:
+        return []
+    xml = urllib.request.urlopen(urllib.request.Request(base + "efetch.fcgi?" + urllib.parse.urlencode(
+        {"db": "pubmed", "id": ",".join(ids), "retmode": "xml"}), headers={"User-Agent": STUDIES_UA}), timeout=15).read().decode("utf-8", "replace")
+    out = []
+    for art in re.findall(r"(?s)<PubmedArticle>(.*?)</PubmedArticle>", xml):
+        pmid = (re.search(r"<PMID[^>]*>(\d+)</PMID>", art) or [None, ""])[1]
+        title = _xml_text((re.search(r"(?s)<ArticleTitle>(.*?)</ArticleTitle>", art) or [None, ""])[1])
+        abstract = " ".join(_xml_text(a) for a in re.findall(r"(?s)<AbstractText[^>]*>(.*?)</AbstractText>", art))
+        year = (re.search(r"(?s)<PubDate>.*?<Year>(\d{4})</Year>", art) or [None, None])[1]
+        venue = _xml_text((re.search(r"(?s)<Journal>.*?<Title>(.*?)</Title>", art) or [None, ""])[1])
+        types = re.findall(r"<PublicationType[^>]*>(.*?)</PublicationType>", art)
+        if not abstract:
+            continue
+        out.append({
+            "title": title, "year": int(year) if year else None, "venue": venue, "authors": [],
+            "abstract": abstract[:2500], "url": "https://pubmed.ncbi.nlm.nih.gov/%s/" % pmid, "source": "PubMed", "cited": 0,
+            "review": any(t in ("Meta-Analysis", "Systematic Review", "Review") for t in types),
+        })
+    return out
+
+
+def find_studies(q, n=8):
+    results, errors = [], []
+
+    def run(fn, k):
+        try:
+            results.extend(fn(q, k))
+        except Exception as e:
+            errors.append("%s: %s" % (fn.__name__, e))
+
+    threads = [threading.Thread(target=run, args=(_openalex, n)), threading.Thread(target=run, args=(_pubmed, max(3, n // 2)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(25)
+    seen, out = set(), []
+    # المراجعات المنهجية أول، بعدين الأكثر استشهاد
+    for r in sorted(results, key=lambda r: (not r["review"], -(r["cited"] or 0))):
+        key = re.sub(r"\W+", "", (r["title"] or "").lower())[:80]
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    if errors:
+        print("studies: " + "; ".join(errors), flush=True)
+    return out[:n]
 
 
 # ── استخراج النص من الملفات (مكتبة Python العادية بس) ──
