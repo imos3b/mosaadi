@@ -20,17 +20,19 @@
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.10.0"
+VERSION = "1.11.1"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
 import base64
+import difflib
 import hashlib
 import hmac
 import html as htmllib
 import io
 import http.client
 import json
+import math
 import os
 import re
 import secrets
@@ -130,7 +132,8 @@ def claude_used(u):
 
 def public(u):
     """اللي نرجّعه للتطبيق: بدون المفتاح ومفتاح Claude الخاص."""
-    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at", "learned", "push", "devices")}
+    out = {k: v for k, v in u.items() if k not in ("token_hash", "claude_key", "claude_usage", "extra_tokens", "device_id", "memory", "backup_at", "learned", "push", "devices",
+                                                     "mem", "mem_proposal", "mem_tidy_at", "last_model")}
     out.setdefault("paired", True)
     out["claude_limit"] = u.get("claude_limit", CLAUDE_DEFAULT_LIMIT)
     out["claude_used"] = claude_used(u)
@@ -314,6 +317,26 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.settings(u, method)
             if path == "/gateway/me/memory":
                 return self.memory(u, method)
+            if path == "/gateway/me/memory/command" and method == "POST":
+                return self.memory_command(u)
+            if path == "/gateway/me/memory/undo" and method == "POST":
+                return self.memory_undo(u)
+            if path == "/gateway/me/memory/proposal" and method == "POST":
+                return self.memory_proposal(u)
+            if path == "/gateway/me/memory/tidy" and method == "POST":
+                threading.Thread(target=tidy_now, args=(u["id"],), daemon=True).start()
+                return self.reply(200, {"started": True})
+            if path == "/gateway/context" and method == "POST":
+                req = json.loads(self.body() or b"{}")
+                return self.reply(200, build_context(u, str(req.get("q", ""))[:2000], str(req.get("conversation", ""))[:64]))
+            if path == "/gateway/me/archive" and method == "DELETE":
+                conv = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("conversation", [""])[0]
+                if conv:
+                    archive_forget(u["id"], conv[:64])
+                else:
+                    with ARCHIVE_LOCK:
+                        save(_mem_file(u["id"], "archive"), [])
+                return self.reply(200, {"ok": True})
             if path == "/gateway/me/learn" and method == "POST":
                 return self.learn(u)
             if path == "/gateway/me/backup":
@@ -519,6 +542,12 @@ class Gateway(BaseHTTPRequestHandler):
         title = urllib.parse.unquote(self.headers.get("X-Chat-Title", ""))[:80]
         job = Job(u["id"], title, self.headers.get("X-Conversation", "")[:64])
         job.temporary = self.headers.get("X-Temporary") == "1"
+        try:
+            msgs = json.loads(data).get("messages") or []
+            last = next((m for m in reversed(msgs) if m.get("role") == "user"), {})
+            job.question = last.get("content") if isinstance(last.get("content"), str) else ""
+        except (ValueError, AttributeError):
+            job.question = ""
         with JOBS_LOCK:
             for jid in [k for k, j in JOBS.items()
                         if time.time() - j.created > (JOB_TTL_TEMP if j.temporary else JOB_TTL)]:
@@ -724,7 +753,8 @@ class Gateway(BaseHTTPRequestHandler):
         threading.Timer(1.0, lambda: os._exit(0)).start()
 
     def me(self, u):
-        self.reply(200, {"user": public(u), "services": services(u), "settings": shared_settings(u), "memory": u.get("memory", ""), "learned": u.get("learned"), "claude": {
+        self.reply(200, {"user": public(u), "services": services(u), "settings": shared_settings(u), "memory": u.get("memory", ""), "memory_items": public_items(mem_items(u)),
+            "memory_proposal": u.get("mem_proposal"), "learned": u.get("learned"), "claude": {
             "shared": bool(shared_claude_key()), "own_key": bool(u.get("claude_key")),
             "limit": None if u["role"] == "owner" or u.get("claude_key") else u.get("claude_limit", CLAUDE_DEFAULT_LIMIT),
             "used": claude_used(u),
@@ -752,15 +782,83 @@ class Gateway(BaseHTTPRequestHandler):
     # ── ذاكرتك: معلومات عنك تنضاف لكل محادثة، ومشتركة بين أجهزتك ──
     def memory(self, u, method):
         if method == "POST":
-            text = str(json.loads(self.body() or b"{}").get("memory", ""))[:MAX_MEMORY]
-            with LOCK:
-                data = load(USERS, {"users": []})
-                for x in data["users"]:
-                    if x["id"] == u["id"]:
-                        x["memory"] = text
-                save(USERS, data)
-            return self.reply(200, {"memory": text})
-        return self.reply(200, {"memory": u.get("memory", "")})
+            req = json.loads(self.body() or b"{}")
+
+            def put(x):
+                cur = mem_items(x)
+                if isinstance(req.get("items"), list):
+                    by_id = {i["id"]: i for i in cur}
+                    new = []
+                    for i in req["items"]:
+                        old = by_id.get(i.get("id")) or {}
+                        new.append(dict(old, text=i.get("text", old.get("text")), cat=i.get("cat", old.get("cat")),
+                                        id=old.get("id") or i.get("id")))
+                else:
+                    # تطبيق قديم يرسل نص: نحافظ على تفاصيل الأسطر اللي ما تغيّرت
+                    by_text = {i["text"]: i for i in cur}
+                    new = [by_text.get(_norm(l)) or {"text": l, "cat": "other", "at": int(time.time())}
+                           for l in str(req.get("memory", ""))[:MAX_MEMORY].splitlines() if _norm(l)]
+                return set_mem(x, new)
+            items = update_user(u["id"], put) or []
+            EMBED_EVENT.set()
+            return self.reply(200, {"memory": "\n".join(i["text"] for i in items), "items": public_items(items)})
+        items = mem_items(u)
+        return self.reply(200, {"memory": "\n".join(i["text"] for i in items), "items": public_items(items),
+                                "proposal": u.get("mem_proposal")})
+
+    # ── «تذكّر …» / «انسَ …» من المحادثة: تنفّذ على طول، ومعها تراجع ──
+    def memory_command(self, u):
+        req = json.loads(self.body() or b"{}")
+        text = str(req.get("text", "")).strip()[:1500]
+        model = pick_local_model(str(req.get("model") or ""))
+        if not text or not model:
+            return self.error(400, "يحتاج موديل محلي.")
+        before = mem_items(u)
+        try:
+            out = ask_json(model, COMMAND_PROMPT.replace("{memory}", _mem_list(before)).replace("{text}", text), timeout=180)
+        except Exception as e:
+            return self.error(502, "ما قدرت أعدّل الذاكرة: %s" % e)
+        conv, title = str(req.get("conversation", ""))[:64], urllib.parse.unquote(str(req.get("title", "")))[:80]
+        res = {}
+
+        def do(x):
+            items = mem_items(x)
+            res["snapshot"] = [dict(i) for i in items]
+            res["changes"] = apply_changes(items, out, conv, title)
+            res["items"] = set_mem(x, items)
+        update_user(u["id"], do)
+        token = ""
+        if res.get("changes"):
+            token = secrets.token_hex(8)
+            now = time.time()
+            for k in [k for k, v in UNDO.items() if v[2] < now]:
+                UNDO.pop(k, None)
+            UNDO[token] = (u["id"], res["snapshot"], now + 3600)
+            EMBED_EVENT.set()
+        items = res.get("items", [])
+        return self.reply(200, {"changes": res.get("changes", []), "undo": token,
+                                "reply": _norm(out.get("reply", ""))[:200],
+                                "memory": "\n".join(i["text"] for i in items), "items": public_items(items)})
+
+    def memory_undo(self, u):
+        token = str(json.loads(self.body() or b"{}").get("undo", ""))
+        entry = UNDO.pop(token, None)
+        if not entry or entry[0] != u["id"]:
+            return self.error(404, "ما عاد أقدر أتراجع عنها.")
+        items = update_user(u["id"], lambda x: set_mem(x, entry[1])) or []
+        return self.reply(200, {"memory": "\n".join(i["text"] for i in items), "items": public_items(items)})
+
+    def memory_proposal(self, u):
+        accept = bool(json.loads(self.body() or b"{}").get("accept"))
+        res = {}
+
+        def do(x):
+            res["changes"] = apply_proposal(x, accept)
+            res["items"] = mem_items(x)
+        update_user(u["id"], do)
+        items = res.get("items", [])
+        return self.reply(200, {"applied": accept, "memory": "\n".join(i["text"] for i in items),
+                                "items": public_items(items)})
 
     # ── يتعلّم من المحادثة: الموديل المحلي يطلّع معلومات ثابتة عنك (على الماك بس) ──
     def learn(self, u):
@@ -770,15 +868,27 @@ class Gateway(BaseHTTPRequestHandler):
         if not model or model.startswith("claude"):
             return self.error(400, "يحتاج موديل محلي.")
         lines = []
+        skip_reply = False
         for m in (req.get("messages") or [])[-24:]:
-            text = str(m.get("content") or "").strip()[:2500]
+            text = str(m.get("content") or "").strip()
+            user = m.get("role") == "user"
+            if user and text.startswith("[[data:"):
+                skip_reply = True          # تقرير (حالة الماك/الـ NAS…): لا هو ولا رده
+                continue
+            if not user and skip_reply:
+                skip_reply = False
+                continue
+            skip_reply = False
             if text:
-                lines.append(("المستخدم: " if m.get("role") == "user" else "المساعد: ") + text)
+                # رد المساعد للسياق بس، فيكفي أوله
+                lines.append("المستخدم: " + text[:2500] if user else "المساعد: " + text[:400])
         if any(l.startswith("المستخدم") for l in lines):
             with BUSY_LOCK:
                 # محادثة وحدة لكل شخص بالطابور (الأحدث تكفي)
                 LEARN_QUEUE[:] = [j for j in LEARN_QUEUE if j["user"] != u["id"]]
-                LEARN_QUEUE.append({"user": u["id"], "model": model, "convo": "\n\n".join(lines)[-14000:]})
+                LEARN_QUEUE.append({"user": u["id"], "model": model, "convo": "\n\n".join(lines)[-14000:],
+                                    "conversation": str(req.get("conversation", ""))[:64],
+                                    "title": str(req.get("title", ""))[:80]})
             LEARN_EVENT.set()
         return self.reply(200, {"queued": True})
 
@@ -1084,6 +1194,7 @@ class Job:
         self.cancelled = False
         self.pushed = False
         self.temporary = False   # محادثة مؤقتة: ما نخلي منها نسخة بعد ما توصل
+        self.question = ""
         self.conn = None
 
     def run(self, upstream, data):
@@ -1129,6 +1240,12 @@ class Job:
                 self.done = True
                 self.cond.notify_all()
             self.after_done()
+            # للتذكّر لاحقاً (المؤقتة ما تنحفظ أبداً)
+            if not self.temporary and not self.cancelled and not self.error and self.conversation:
+                try:
+                    archive_add(self.user, self.conversation, self.title, self.question, "".join(self.content))
+                except Exception as e:
+                    sys.stderr.write("archive failed: %s\n" % e)
 
     def add(self, line):
         try:
@@ -1598,6 +1715,479 @@ def brief_worker():
             sys.stderr.write("brief failed: %s\n" % e)
 
 
+# ─────────── الذاكرة v2: أقسام، تعديل وحذف، أوامر، تذكّر المحادثات، ترتيب أسبوعي ───────────
+MEMDIR = os.path.join(HOME, "memory")
+MEM_CATS = ("about", "work", "devices", "projects", "style", "other")
+MEM_CORE = ("about", "style")          # تنرسل دايم مهما كبرت الذاكرة
+MEM_ALL_UNDER = 25                     # لو الأسطر أقل من كذا: تنرسل كلها
+EMBED_MODEL = "embeddinggemma"     # صغير (~600MB) ويفهم العربي
+ARCHIVE_MAX = 3000
+TIDY_EVERY = 7 * 86400
+UNDO = {}                              # token → (user, items, expires)
+EMBED_STATE = {"missing": False, "pulling": False}
+ARCHIVE_LOCK = threading.Lock()
+
+RECALL_CUES = re.compile(
+    r"(قلت|قلتلي|قلت لي|قلتها|سألتك|سالتك|تكلمنا|تكلّمنا|ذكرت|ذكرتلي|المرة اللي|المره اللي|الأسبوع الماضي|الاسبوع الماضي|"
+    r"الشهر الماضي|أمس|امس|قبل كم|تذكر لما|تذكّر لما|محادثتنا|محادثة سابقة|نصحتني|اقترحت|وش كان|ايش كان|"
+    r"remember when|last time|you said|you told|we talked|earlier)", re.I)
+
+CAT_HINT = "الأقسام: about (عنه: اسم، مدينة، لغة، عائلة)، work (شغله)، devices (أجهزته وسيرفراته وأنظمته)، projects (مشاريعه المستمرة)، style (طريقة الرد اللي يحبها)، other."
+
+MEM_RULES = """لا تحفظ:
+- أي قراءات أو أرقام حالة: حرارة، نسبة استخدام، رام أو مساحة مستخدمة، سرعة، حالة سيرفر
+- أي شي جا من تقرير أو ملف أو رابط أو تغريدة أرسلها (هذا محتوى، مو معلومات عنه)
+- أشياء مؤقتة (اليوم، بكرة، موعد، مزاج، مشكلة انحلّت)
+- معلومات عن ناس ثانيين، أو أسئلة عامة ما تخصّه
+- أي شي قاله المساعد وما أكّده المستخدم
+- كلمات سر، مفاتيح، أرقام حسابات أو هويات
+- صحة أو أمراض أو أمور حساسة
+كل جملة بالعربي، قصيرة، بصيغة الغائب (مثل: يشتغل مطوّر تطبيقات)."""
+
+LEARN_PROMPT_V2 = """مهمتك تحدّث ذاكرة المساعد عن المستخدم من المحادثة: معلومات ثابتة عنه تفيد في محادثات جاية.
+خذ بس اللي قاله المستخدم عن نفسه بكلامه. ردود المساعد موجودة للسياق بس، لا تطلّع منها معلومات.
+
+احفظ: اسمه، شغله، مدينته، لهجته، أجهزته وسيرفراته، مشاريعه المستمرة، طريقة الرد اللي يحبها، اهتمامات ثابتة ذكرها هو.
+""" + MEM_RULES + """
+
+لو معلومة في الذاكرة تغيّرت (انتقل، غيّر جهازه، خلّص مشروع): حطها في update بدل ما تضيف سطر جديد.
+لو معلومة صارت غلط أو انتهت: حطها في remove.
+""" + CAT_HINT + """
+
+الذاكرة الحالية (كل سطر بين علامتين):
+{memory}
+
+المحادثة:
+{convo}
+
+رد بـ JSON بس:
+{"add": [{"text": "...", "cat": "about"}], "update": [{"old": "السطر القديم بالضبط", "new": "...", "cat": "about"}], "remove": ["السطر بالضبط"]}
+لو ما فيه شي: {"add": [], "update": [], "remove": []}"""
+
+COMMAND_PROMPT = """المستخدم طلب منك تعدّل ذاكرتك عنه. نفّذ طلبه بالضبط، لا تزيد ولا تنقص.
+- «تذكّر / احفظ ...» → add (أو update لو تعارض سطر موجود)
+- «انسَ / امسح ...» → remove للأسطر المتعلقة بس
+""" + CAT_HINT + """
+كل جملة بالعربي، قصيرة، بصيغة الغائب. (هنا المستخدم طلب بنفسه، فاحفظ اللي طلبه حتى لو كان عن موضوع حساس، إلا كلمات السر وأرقام الحسابات والهويات.)
+
+الذاكرة الحالية (كل سطر بين علامتين):
+{memory}
+
+طلب المستخدم:
+{text}
+
+رد بـ JSON بس:
+{"add": [{"text": "...", "cat": "about"}], "update": [{"old": "السطر القديم بالضبط", "new": "...", "cat": "about"}], "remove": ["السطر بالضبط"], "reply": "جملة قصيرة بالعامية السعودية تأكد وش سويت"}"""
+
+TIDY_PROMPT = """رتّب ذاكرة المساعد عن المستخدم:
+- merge: أسطر تقول نفس الشي أو مكمّلة لبعض → سطر واحد
+- shorten: سطر طويل → أقصر بنفس المعنى
+- remove: سطر مؤقت انتهى، أو تكرار واضح (مع السبب)
+- cats: صنّف كل سطر في قسمه
+""" + CAT_HINT + """
+لا تخترع معلومات، ولا تحذف شي مهم. لو ما يحتاج: قوائم فاضية.
+
+الذاكرة (كل سطر بين علامتين):
+{memory}
+
+رد بـ JSON بس:
+{"merge": [{"old": ["سطر", "سطر"], "new": "..."}], "shorten": [{"old": "...", "new": "..."}], "remove": [{"old": "...", "reason": "..."}], "cats": [{"text": "...", "cat": "devices"}]}"""
+
+
+def _norm(s):
+    return re.sub(r"\s+", " ", str(s or "")).strip(" -•.‏‎").strip()
+
+
+def mem_items(u):
+    """أسطر الذاكرة مع تفاصيلها. المستخدم القديم (نص بس) يتحوّل تلقائياً."""
+    items = u.get("mem")
+    if isinstance(items, list):
+        return [dict(i) for i in items if _norm(i.get("text"))]
+    return [{"id": secrets.token_hex(4), "text": _norm(l), "cat": "other", "at": 0}
+            for l in str(u.get("memory", "")).splitlines() if _norm(l)]
+
+
+def set_mem(x, items):
+    """يحفظ القائمة + النص (للتطبيقات القديمة) بنفس الوقت. يقص لو تعدّى الحد."""
+    out, size = [], 0
+    for i in items:
+        t = _norm(i.get("text"))[:240]
+        if not t or size + len(t) + 1 > MAX_MEMORY:
+            continue
+        size += len(t) + 1
+        out.append({"id": i.get("id") or secrets.token_hex(4), "text": t,
+                    "cat": i.get("cat") if i.get("cat") in MEM_CATS else "other",
+                    "src": i.get("src") or "", "title": i.get("title") or "", "at": int(i.get("at") or 0)})
+    x["mem"] = out
+    x["memory"] = "\n".join(i["text"] for i in out)
+    return out
+
+
+def public_items(items):
+    return [{k: i.get(k) for k in ("id", "text", "cat", "src", "title", "at")} for i in items]
+
+
+def _find(items, old):
+    """السطر اللي يقصده الموديل (بالضبط، أو قريب منه)."""
+    o = _norm(old).lower()
+    if not o:
+        return None
+    for i in items:
+        if _norm(i["text"]).lower() == o:
+            return i
+    best, score = None, 0.0
+    for i in items:
+        t = _norm(i["text"]).lower()
+        s = 0.9 if (o in t or t in o) else difflib.SequenceMatcher(None, o, t).ratio()
+        if s > score:
+            best, score = i, s
+    return best if score >= 0.72 else None
+
+
+STAT_RE = re.compile(r"(\d+(\.\d+)?\s*[%٪]|°|درجة حرار|حرارت|بنسبة|نسبة استخدام|يعمل بنسبة|مستخدم(ة)? \d)")
+
+
+def apply_changes(items, ch, src="", title="", strict=False):
+    """يطبّق add/update/remove ويرجع وش تغيّر فعلاً. strict (التعلّم التلقائي): يرفض قراءات الحالة."""
+    now = int(time.time())
+    if strict:
+        ok = lambda t: not STAT_RE.search(str(t or ""))
+        ch = dict(ch, add=[a for a in (ch.get("add") or []) if ok(a.get("text") if isinstance(a, dict) else a)],
+                  update=[u for u in (ch.get("update") or []) if isinstance(u, dict) and ok(u.get("new"))])
+    done = []
+    for r in (ch.get("remove") or [])[:10]:
+        hit = _find(items, r.get("old") if isinstance(r, dict) else r)
+        if hit:
+            items.remove(hit)
+            done.append({"type": "remove", "old": hit["text"]})
+    for up in (ch.get("update") or [])[:10]:
+        if not isinstance(up, dict):
+            continue
+        new = _norm(up.get("new"))
+        hit = _find(items, up.get("old"))
+        if not new or not (4 <= len(new) <= 240):
+            continue
+        if hit:
+            if _norm(hit["text"]) == new:
+                continue
+            done.append({"type": "update", "old": hit["text"], "new": new})
+            hit.update(text=new, at=now, src=src or hit.get("src", ""), title=title or hit.get("title", ""))
+            if up.get("cat") in MEM_CATS:
+                hit["cat"] = up["cat"]
+        else:
+            ch.setdefault("add", []).append({"text": new, "cat": up.get("cat")})
+    have = [_norm(i["text"]).lower() for i in items]
+    added = 0
+    for a in (ch.get("add") or []):
+        text = _norm(a.get("text") if isinstance(a, dict) else a)
+        cat = a.get("cat") if isinstance(a, dict) else None
+        low = text.lower()
+        if not (4 <= len(text) <= 240) or any(low in h or h in low for h in have):
+            continue
+        items.append({"id": secrets.token_hex(4), "text": text, "cat": cat if cat in MEM_CATS else "other",
+                      "src": src, "title": title, "at": now})
+        have.append(low)
+        done.append({"type": "add", "new": text})
+        added += 1
+        if added >= 6:
+            break
+    return done
+
+
+def _mem_list(items):
+    return "\n".join("«%s»" % i["text"] for i in items) or "(فاضية)"
+
+
+def pick_local_model(pref=""):
+    """موديل محلي للمهام الصغيرة: اللي طلبه التطبيق، وإلا المحمّل الحين، وإلا أول واحد."""
+    if pref and not pref.startswith("claude"):
+        return pref
+    base = load(CONFIG, {})["upstreams"]["ollama"].rstrip("/")
+    for path in ("/api/ps", "/api/tags"):
+        try:
+            with urllib.request.urlopen(base + path, timeout=5) as r:
+                models = [m.get("name") for m in json.loads(r.read()).get("models", [])]
+            models = [m for m in models if m and "embed" not in m]
+            if models:
+                return models[0]
+        except Exception:
+            pass
+    return ""
+
+
+def ask_json(model, prompt, timeout=300):
+    body = json.dumps({"model": model, "stream": False, "format": "json", "think": False,
+                       "messages": [{"role": "user", "content": prompt}],
+                       "options": {"temperature": 0.1, "num_ctx": 8192}}).encode()
+    base = load(CONFIG, {})["upstreams"]["ollama"].rstrip("/")
+    r = urllib.request.urlopen(urllib.request.Request(base + "/api/chat", data=body,
+                                                      headers={"Content-Type": "application/json"}), timeout=timeout)
+    out = json.loads(json.loads(r.read()).get("message", {}).get("content", "") or "{}")
+    return out if isinstance(out, dict) else {}
+
+
+def update_user(uid, fn):
+    """يعدّل مستخدم واحد داخل القفل ويرجع ناتج fn."""
+    with LOCK:
+        data = load(USERS, {"users": []})
+        for x in data["users"]:
+            if x["id"] == uid:
+                res = fn(x)
+                save(USERS, data)
+                return res
+    return None
+
+
+# ── Embeddings (على الماك) ──
+def embed(texts, kind="search_document"):
+    """يرجع قائمة vectors، أو None لو الموديل مو موجود (ويبدأ تنزيله مرة وحدة)."""
+    if not texts:
+        return []
+    base = load(CONFIG, {})["upstreams"]["ollama"].rstrip("/")
+    fmt = "task: search result | query: %s" if kind == "search_query" else "title: none | text: %s"
+    body = json.dumps({"model": EMBED_MODEL, "input": [fmt % t[:2000] for t in texts]}).encode()
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(base + "/api/embed", data=body,
+                                                          headers={"Content-Type": "application/json"}), timeout=60)
+        EMBED_STATE["missing"] = False
+        return [[round(v, 4) for v in e] for e in json.loads(r.read()).get("embeddings", [])]
+    except urllib.error.HTTPError as e:
+        if e.code == 404 and not EMBED_STATE["pulling"]:
+            EMBED_STATE.update(missing=True, pulling=True)
+            try:
+                start_pull(base, EMBED_MODEL)
+            except Exception:
+                pass
+        return None
+    except Exception:
+        return None
+
+
+def cosine(a, b):
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    return dot / (na * nb) if na and nb else 0.0
+
+
+def _tokens(s):
+    return {w for w in re.findall(r"[\w؀-ۿ]{3,}", str(s).lower())}
+
+
+def keyword_score(q, t):
+    a, b = _tokens(q), _tokens(t)
+    return len(a & b) / (len(a) ** 0.5 * len(b) ** 0.5) if a and b else 0.0
+
+
+def _mem_file(uid, name):
+    os.makedirs(MEMDIR, exist_ok=True)
+    return os.path.join(MEMDIR, "%s-%s.json" % (re.sub(r"[^0-9a-f]", "", uid), name))
+
+
+# ── أرشيف المحادثات (للتذكّر) ──
+def archive_add(uid, conv, title, question, answer):
+    if not conv or not question.strip() or not answer.strip():
+        return
+    path = _mem_file(uid, "archive")
+    with ARCHIVE_LOCK:
+        arc = load(path, [])
+        arc.append({"conv": conv, "title": title[:80], "q": question.strip()[:1200],
+                    "a": answer.strip()[:1800], "at": int(time.time()), "emb": None})
+        save(path, arc[-ARCHIVE_MAX:])
+    EMBED_EVENT.set()
+
+
+def archive_forget(uid, conv):
+    path = _mem_file(uid, "archive")
+    with ARCHIVE_LOCK:
+        arc = [e for e in load(path, []) if e.get("conv") != conv]
+        save(path, arc)
+
+
+EMBED_EVENT = threading.Event()
+
+
+def embed_worker():
+    """يحسب الـ embeddings للأرشيف وأسطر الذاكرة لما Ollama يفضى."""
+    while True:
+        EMBED_EVENT.wait(600)
+        EMBED_EVENT.clear()
+        for u in load(USERS, {"users": []})["users"]:
+            try:
+                path = _mem_file(u["id"], "archive")
+                with ARCHIVE_LOCK:
+                    arc = load(path, [])
+                todo = [i for i, e in enumerate(arc) if not e.get("emb")][:64]
+                if todo:
+                    vecs = embed([arc[i]["q"] + "\n" + arc[i]["a"][:600] for i in todo])
+                    if vecs:
+                        with ARCHIVE_LOCK:
+                            cur = load(path, [])
+                            keyed = {(e["conv"], e["at"], e["q"][:50]): e for e in cur}
+                            for i, v in zip(todo, vecs):
+                                k = (arc[i]["conv"], arc[i]["at"], arc[i]["q"][:50])
+                                if k in keyed:
+                                    keyed[k]["emb"] = v
+                            save(path, cur)
+                        if len(todo) == 64:
+                            EMBED_EVENT.set()
+                mem_embeddings(u)
+            except Exception as e:
+                sys.stderr.write("embed failed: %s\n" % e)
+
+
+def mem_embeddings(u):
+    """vectors لأسطر الذاكرة (ملف جانبي: النص ← vector)."""
+    path = _mem_file(u["id"], "mem-emb")
+    cache = load(path, {})
+    items = mem_items(u)
+    need = [i["text"] for i in items if i["text"] not in cache]
+    if need:
+        vecs = embed(need)
+        if vecs:
+            cache.update(zip(need, vecs))
+            keep = {i["text"] for i in items}
+            cache = {k: v for k, v in cache.items() if k in keep}
+            save(path, cache)
+    return cache
+
+
+def build_context(u, q, conv=""):
+    """الذاكرة المرتبطة بالسؤال + مقتطفات من محادثات سابقة لو تفيد."""
+    items = mem_items(u)
+    qv = None
+    if q.strip():
+        v = embed([q], "search_query")
+        qv = v[0] if v else None
+    # الذاكرة
+    if len(items) <= MEM_ALL_UNDER or not q.strip():
+        chosen = items
+    else:
+        cache = load(_mem_file(u["id"], "mem-emb"), {})
+        core = [i for i in items if i["cat"] in MEM_CORE]
+        rest = [i for i in items if i["cat"] not in MEM_CORE]
+        score = (lambda i: cosine(qv, cache.get(i["text"]))) if qv else (lambda i: keyword_score(q, i["text"]))
+        rest.sort(key=score, reverse=True)
+        chosen = core + rest[:12]
+    # التذكّر
+    cue = bool(RECALL_CUES.search(q))
+    recall = []
+    with ARCHIVE_LOCK:
+        arc = [e for e in load(_mem_file(u["id"], "archive"), []) if e.get("conv") != conv]
+    if arc and q.strip():
+        if qv:
+            # بدون كلمة تذكّر: لازم يكون قريب بالمعنى وفيه كلمات مشتركة، عشان ما يدخّل شي ما له دخل
+            scored = [(cosine(qv, e.get("emb")), e) for e in arc
+                      if e.get("emb") and (cue or keyword_score(q, e["q"] + " " + e["a"]) >= 0.15)]
+            floor, n = (0.35, 3) if cue else (0.6, 2)
+        else:
+            scored = [(keyword_score(q, e["q"] + " " + e["a"]), e) for e in arc] if cue else []
+            floor, n = 0.25, 3
+        scored.sort(key=lambda s: s[0], reverse=True)
+        seen = set()
+        for s, e in scored:
+            if s < floor or len(recall) >= n:
+                break
+            if e["conv"] in seen:
+                continue
+            seen.add(e["conv"])
+            recall.append({"conv": e["conv"], "title": e["title"], "at": e["at"],
+                           "q": e["q"][:500], "a": e["a"][:900], "score": round(s, 3)})
+    return {"memory": [i["text"] for i in chosen], "items": public_items(chosen), "recall": recall,
+            "embeddings": not EMBED_STATE["missing"]}
+
+
+# ── الترتيب الأسبوعي ──
+def tidy_now(uid):
+    u = find_user_by_id(uid)
+    if not u:
+        return
+    items = mem_items(u)
+    model = pick_local_model(u.get("last_model", ""))
+    if len(items) < 8 or not model:
+        update_user(uid, lambda x: x.update(mem_tidy_at=int(time.time())))
+        return
+    out = ask_json(model, TIDY_PROMPT.replace("{memory}", _mem_list(items)), timeout=600)
+    changes = []
+    used = set()
+    for m in (out.get("merge") or [])[:8]:
+        olds = [h["text"] for h in (_find(items, o) for o in (m.get("old") or [])) if h]
+        olds = [o for o in dict.fromkeys(olds) if o not in used]
+        new = _norm(m.get("new"))
+        if len(olds) >= 2 and 4 <= len(new) <= 240:
+            used.update(olds)
+            changes.append({"type": "merge", "old": olds, "new": new})
+    for s in (out.get("shorten") or [])[:8]:
+        h = _find(items, s.get("old"))
+        new = _norm(s.get("new"))
+        if h and h["text"] not in used and 4 <= len(new) < len(h["text"]):
+            used.add(h["text"])
+            changes.append({"type": "shorten", "old": [h["text"]], "new": new})
+    for r in (out.get("remove") or [])[:8]:
+        h = _find(items, r.get("old") if isinstance(r, dict) else r)
+        if h and h["text"] not in used:
+            used.add(h["text"])
+            changes.append({"type": "remove", "old": [h["text"]], "reason": _norm((r or {}).get("reason", "") if isinstance(r, dict) else "")[:120]})
+    cats = {}
+    for c in (out.get("cats") or []):
+        h = _find(items, c.get("text"))
+        if h and c.get("cat") in MEM_CATS:
+            cats[h["id"]] = c["cat"]
+
+    def save_it(x):
+        cur = mem_items(x)
+        for i in cur:   # التصنيف ما يحذف شي: يتطبّق على طول
+            if i["id"] in cats and i["cat"] == "other":
+                i["cat"] = cats[i["id"]]
+        set_mem(x, cur)
+        x["mem_tidy_at"] = int(time.time())
+        if changes:
+            x["mem_proposal"] = {"at": int(time.time()), "changes": changes}
+    update_user(uid, save_it)
+    if changes:
+        send_push(uid, "رتّبت ذاكرتك", "%d تغييرات تنتظر موافقتك" % len(changes), {"open": "memory"})
+
+
+def tidy_worker():
+    while True:
+        time.sleep(3600)
+        for u in load(USERS, {"users": []})["users"]:
+            if u.get("mem_proposal") or time.time() - u.get("mem_tidy_at", 0) < TIDY_EVERY:
+                continue
+            with BUSY_LOCK:
+                idle = BUSY["active"] == 0 and time.time() - BUSY["last"] > 600
+            if not idle:
+                break
+            try:
+                tidy_now(u["id"])
+            except Exception as e:
+                sys.stderr.write("tidy failed: %s\n" % e)
+
+
+def apply_proposal(x, accept):
+    p = x.pop("mem_proposal", None)
+    if not p or not accept:
+        return []
+    items = mem_items(x)
+    now = int(time.time())
+    for c in p.get("changes", []):
+        olds = [h for h in (_find(items, o) for o in c.get("old", [])) if h]
+        if not olds:
+            continue
+        if c["type"] == "remove":
+            for h in olds:
+                items.remove(h)
+        else:
+            keep = olds[0]
+            for h in olds[1:]:
+                items.remove(h)
+            keep.update(text=c["new"], at=now)
+    set_mem(x, items)
+    return p.get("changes", [])
+
+
 # ── التعلّم بالخلفية ──
 BUSY = {"active": 0, "last": 0.0}
 BUSY_LOCK = threading.Lock()
@@ -1629,37 +2219,19 @@ def learn_now(job):
     u = find_user_by_id(job["user"])
     if not u:
         return
-    current = u.get("memory", "")
-    prompt = LEARN_PROMPT.replace("{memory}", current or "(فاضية)").replace("{convo}", job["convo"])
-    body = json.dumps({
-        "model": job["model"], "stream": False, "format": "json",
-        "messages": [{"role": "user", "content": prompt}],
-        "options": {"temperature": 0.1, "num_ctx": 8192},
-    }).encode()
-    upstream = load(CONFIG, {})["upstreams"]["ollama"].rstrip("/")
-    r = urllib.request.urlopen(urllib.request.Request(
-        upstream + "/api/chat", data=body, headers={"Content-Type": "application/json"}), timeout=300)
-    facts = json.loads(json.loads(r.read()).get("message", {}).get("content", "") or "{}").get("facts", [])
-    with LOCK:
-        data = load(USERS, {"users": []})
-        for x in data["users"]:
-            if x["id"] != job["user"]:
-                continue
-            have = [l.strip() for l in x.get("memory", "").splitlines() if l.strip()]
-            lower = [l.lower() for l in have]
-            added = []
-            for f in facts if isinstance(facts, list) else []:
-                f = re.sub(r"\s+", " ", str(f)).strip(" -•.")
-                if not (4 <= len(f) <= 200) or any(f.lower() in l or l in f.lower() for l in lower):
-                    continue
-                added.append(f)
-                lower.append(f.lower())
-                if len(added) >= 5:
-                    break
-            if added:
-                x["memory"] = "\n".join(have + added)[:MAX_MEMORY]
-                x["learned"] = {"lines": added, "at": int(time.time())}
-        save(USERS, data)
+    prompt = LEARN_PROMPT_V2.replace("{memory}", _mem_list(mem_items(u))).replace("{convo}", job["convo"])
+    out = ask_json(job["model"], prompt)
+
+    def do(x):
+        items = mem_items(x)
+        changes = apply_changes(items, out, job.get("conversation", ""), job.get("title", ""), strict=True)
+        x["last_model"] = job["model"]
+        if changes:
+            set_mem(x, items)
+            x["learned"] = {"lines": [c["new"] for c in changes if c.get("new")], "changes": changes,
+                            "at": int(time.time())}
+    update_user(job["user"], do)
+    EMBED_EVENT.set()
 
 
 def shared_settings(u):
@@ -1736,6 +2308,8 @@ def main():
         server.daemon_threads = True
         threading.Thread(target=learn_worker, daemon=True).start()
         threading.Thread(target=brief_worker, daemon=True).start()
+        threading.Thread(target=embed_worker, daemon=True).start()
+        threading.Thread(target=tidy_worker, daemon=True).start()
         print("البوابة شغالة على %s:%d" % (host, port), flush=True)
         server.serve_forever()
 
@@ -1870,11 +2444,10 @@ def main():
                 if u is main:
                     continue
                 main["extra_tokens"] = (main.get("extra_tokens", []) + [u["token_hash"]] + u.get("extra_tokens", []))[-10:]
-                lines = [l for l in main.get("memory", "").splitlines() if l.strip()]
-                for l in u.get("memory", "").splitlines():
-                    if l.strip() and l.strip() not in lines:
-                        lines.append(l.strip())
-                main["memory"] = "\n".join(lines)[:MAX_MEMORY]
+                merged = mem_items(main)
+                have = {i["text"] for i in merged}
+                merged += [i for i in mem_items(u) if i["text"] not in have]
+                set_mem(main, merged)
                 main["push"] = (main.get("push", []) + [t for t in u.get("push", [])
                                                          if t["token"] not in {x["token"] for x in main.get("push", [])}])[-5:]
                 main["display_name"] = main.get("display_name") or u.get("display_name", "")
