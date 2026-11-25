@@ -20,7 +20,7 @@
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.9.0"
+VERSION = "1.10.0"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -39,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -329,6 +330,8 @@ class Gateway(BaseHTTPRequestHandler):
                 return self.studies_api(u)
             if path == "/gateway/extract" and method == "POST":
                 return self.extract_api(u)
+            if path == "/gateway/tts":
+                return self.tts_api(u, method)
             if path.startswith("/gateway/jobs/"):
                 return self.job_api(u, method, path)
             if path == "/gateway/pair-code" and method == "POST":
@@ -453,6 +456,32 @@ class Gateway(BaseHTTPRequestHandler):
         if not text.strip():
             return self.error(422, "الملف ما فيه نص أقدر أقراه.")
         return self.reply(200, {"name": name, "text": text[:300_000], "pages": pages})
+
+    # ── صوت القراءة الطبيعي: يمرّر لخادم الصوت على الماك (mac-setup/tts) ──
+    def tts_api(self, u, method):
+        if not has(u, "chat"):
+            return self.error(403, "ما عندك صلاحية.")
+        base = load(CONFIG, {}).get("upstreams", {}).get("tts", "http://127.0.0.1:11610").rstrip("/")
+        try:
+            if method == "GET":
+                with urllib.request.urlopen(base + "/", timeout=3) as r:
+                    st = json.loads(r.read() or b"{}")
+                return self.reply(200, {"available": bool(st.get("ready")), "loading": not st.get("ready")})
+            req = urllib.request.Request(base + "/tts", data=self.body(), method="POST",
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                data = r.read()
+        except urllib.error.HTTPError as e:
+            return self.error(e.code, "صوت الماك: %s" % (e.read()[:200].decode("utf-8", "ignore") or e.reason))
+        except Exception:
+            if method == "GET":
+                return self.reply(200, {"available": False, "loading": False})
+            return self.error(503, "صوت الماك مو شغّال. ركّبه بسكربت install-tts.sh")
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     # ── تنزيل موديل: يكمّل على الماك حتى لو الجوال انقطع، ولو رجعت تشوف نفس التقدّم ──
     def pull_stream(self, upstream, data):
