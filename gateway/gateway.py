@@ -20,7 +20,7 @@
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.11.1"
+VERSION = "1.11.3"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -437,6 +437,15 @@ class Gateway(BaseHTTPRequestHandler):
 
         if rest == "/api/pull" and method == "POST" and data:
             return self.pull_stream(upstream, data)
+        if rest == "/api/chat" and method == "POST" and data:
+            # موديل embeddings (مثل embeddinggemma) ما يسولف: نحوّل لموديل محادثة بدل الخطأ
+            try:
+                req = json.loads(data)
+                if is_embed_model(req.get("model", "")):
+                    req["model"] = pick_local_model()
+                    data = json.dumps(req).encode()
+            except (ValueError, AttributeError):
+                pass
         if rest == "/api/chat" and method == "POST" and data and json.loads(data).get("stream", True) is not False:
             return self.chat_job(u, upstream, data)
         if rest in ("/api/chat", "/api/generate"):
@@ -1898,6 +1907,13 @@ def _mem_list(items):
     return "\n".join("«%s»" % i["text"] for i in items) or "(فاضية)"
 
 
+EMBED_RE = re.compile(r"(embed|bge-|bge:|mxbai|minilm|^e5-|snowflake-arctic)", re.I)
+
+
+def is_embed_model(name):
+    return bool(EMBED_RE.search(str(name or "")))
+
+
 def pick_local_model(pref=""):
     """موديل محلي للمهام الصغيرة: اللي طلبه التطبيق، وإلا المحمّل الحين، وإلا أول واحد."""
     if pref and not pref.startswith("claude"):
@@ -1907,7 +1923,7 @@ def pick_local_model(pref=""):
         try:
             with urllib.request.urlopen(base + path, timeout=5) as r:
                 models = [m.get("name") for m in json.loads(r.read()).get("models", [])]
-            models = [m for m in models if m and "embed" not in m]
+            models = [m for m in models if m and not is_embed_model(m)]
             if models:
                 return models[0]
         except Exception:
@@ -1945,7 +1961,8 @@ def embed(texts, kind="search_document"):
         return []
     base = load(CONFIG, {})["upstreams"]["ollama"].rstrip("/")
     fmt = "task: search result | query: %s" if kind == "search_query" else "title: none | text: %s"
-    body = json.dumps({"model": EMBED_MODEL, "input": [fmt % t[:2000] for t in texts]}).encode()
+    # keep_alive قصير: ما يقعد ياخذ ذاكرة جنب موديل المحادثة (جهاز 16GB)
+    body = json.dumps({"model": EMBED_MODEL, "input": [fmt % t[:2000] for t in texts], "keep_alive": "2m"}).encode()
     try:
         r = urllib.request.urlopen(urllib.request.Request(base + "/api/embed", data=body,
                                                           headers={"Content-Type": "application/json"}), timeout=60)
