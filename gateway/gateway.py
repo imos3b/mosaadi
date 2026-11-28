@@ -20,7 +20,7 @@
   python3 gateway.py wake-setup <عنوان>  تجهيز تصحية الماك من الـ NAS (مثل http://100.71.65.118:9009)
 """
 
-VERSION = "1.11.3"
+VERSION = "1.12.0"
 # التحديث بضغطة من التطبيق: البوابة تنزّل نفسها من هنا (غيّره في config.json: "update_url")
 DEFAULT_UPDATE_URL = "https://imos3b.github.io/mosaadi/gateway/gateway.py"
 
@@ -31,6 +31,7 @@ import hmac
 import html as htmllib
 import io
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -281,6 +282,45 @@ class Gateway(BaseHTTPRequestHandler):
         touch(u["id"])
         return u
 
+    # ── من وين جا الطلب؟ (Tailscale Funnel = الإنترنت العام) ──
+    def is_public(self):
+        """الطلب جا من الرابط العام (Funnel)؟ البيت وTailscale (الشبكة الخاصة) = لا."""
+        if self.headers.get("Tailscale-Funnel-Request"):
+            return True
+        try:
+            ip = ipaddress.ip_address(self.client_address[0])
+        except ValueError:
+            return True
+        if ip.is_loopback:
+            # Funnel يوصل عن طريق tailscaled على نفس الماك: فيه X-Forwarded-For وبدون هوية Tailscale
+            # (Tailscale يضيف هوية المستخدم لطلبات شبكتك الخاصة بس، ويشيلها لو أحد حاول يزوّرها)
+            return bool(self.headers.get("X-Forwarded-For")) and not self.headers.get("Tailscale-User-Login")
+        tailnet = ipaddress.ip_network("100.64.0.0/10")
+        tailnet6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+        return not (ip.is_private or ip in tailnet or ip in tailnet6)
+
+    def client_ip(self):
+        """عنوان الطرف الثاني الحقيقي (للقفل بعد المحاولات الغلط)، حتى لو جا عن طريق Funnel."""
+        ip = self.client_address[0]
+        fwd = self.headers.get("X-Forwarded-For", "")
+        if ip in ("127.0.0.1", "::1") and fwd:
+            return fwd.split(",")[0].strip()[:64]
+        return ip
+
+    def admin_blocked(self, method, path):
+        """عمليات حساسة: من البيت أو Tailscale بس، مو من الرابط العام."""
+        if not self.is_public():
+            return False
+        write = method not in ("GET", "HEAD")
+        if path in ("/gateway/pair-code", "/gateway/ollama-lock") or path.startswith("/gateway/users"):
+            return True
+        if path in ("/gateway/update", "/gateway/settings", "/gateway/claude", "/gateway/me/claude") and write:
+            return True
+        if any(path.startswith("/ollama" + p) for p in
+               ("/api/pull", "/api/delete", "/api/create", "/api/copy", "/api/push", "/api/blobs")):
+            return True
+        return False
+
     # ── التوجيه ──
     def do_GET(self):
         self.route("GET")
@@ -306,11 +346,13 @@ class Gateway(BaseHTTPRequestHandler):
             if path == "/gateway/pair" and method == "POST":
                 return self.pair()
             if path == "/" and method in ("GET", "HEAD"):
-                return self.reply(200, {"gateway": "PrivateAI", "ok": True})
+                return self.reply(200, {"gateway": "PrivateAI", "ok": True, "public": self.is_public()})
 
             u = self.user()
             if not u:
                 return
+            if self.admin_blocked(method, path):
+                return self.error(403, "هذي العملية تشتغل من البيت أو من Tailscale بس، مو من الرابط العام.")
             if path == "/gateway/me":
                 return self.me(u)
             if path == "/gateway/settings":
@@ -717,7 +759,7 @@ class Gateway(BaseHTTPRequestHandler):
         raw = str(req.get("code", ""))
         # أرقام عربية (٠١٢) أو مسافات: نحولها لأرقام إنجليزية
         code = "".join(str(int(ch)) for ch in raw if ch.isdigit())
-        result, err = redeem(code, str(req.get("device", ""))[:40], self.client_address[0],
+        result, err = redeem(code, str(req.get("device", ""))[:40], self.client_ip(),
                              str(req.get("device_id", ""))[:64])
         if err:
             sys.stderr.write("pair failed: raw=%r\n" % raw)
